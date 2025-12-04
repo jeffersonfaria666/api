@@ -1,0 +1,21 @@
+# Dependencias principales
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-Limiter==3.3.0
+yt-dlp==2023.10.13
+Werkzeug==2.3.7
+
+# Dependencias para producción
+gunicorn==21.2.0
+waitress==2.1.2
+redis==5.0.0
+
+# Utilidades
+requests==2.31.0
+python-dotenv==1.0.0
+click==8.1.7
+
+# Para desarrollo (opcional)
+pytest==7.4.2
+black==23.9.1
+flake8==6.1.0
