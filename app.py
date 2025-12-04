@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 🚀 YOUTUBE SERVER API - DESPLIEGUE RENDER.COM
-Versión: 2.0.0
+Versión: 3.0.0 - SIN AUTENTICACIÓN
 Autor: YouTube Server Team
 """
 
@@ -9,17 +9,14 @@ import os
 import sys
 import json
 import logging
-import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import yt_dlp
-import redis
 from werkzeug.middleware.proxy_fix import ProxyFix
-import gunicorn
 
 # Configuración
 class Config:
@@ -28,9 +25,8 @@ class Config:
     HOST = '0.0.0.0'
     DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
     
-    # Seguridad
-    API_KEY = os.environ.get('API_KEY', secrets.token_urlsafe(32))
-    RATE_LIMIT = os.environ.get('RATE_LIMIT', '100 per hour')
+    # Rate limiting más permisivo para API pública
+    RATE_LIMIT = os.environ.get('RATE_LIMIT', '200 per hour')
     
     # Redis para rate limiting (opcional en Render)
     REDIS_URL = os.environ.get('REDIS_URL', None)
@@ -49,6 +45,10 @@ class Config:
 # Configuración de logging
 def setup_logging():
     """Configura el sistema de logging"""
+    # Crear carpeta logs si no existe
+    if not os.path.exists('logs'):
+        os.makedirs('logs', exist_ok=True)
+    
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     
     # Log a consola (para Render)
@@ -57,7 +57,8 @@ def setup_logging():
     console_handler.setFormatter(logging.Formatter(log_format))
     
     # Log a archivo
-    file_handler = logging.FileHandler('logs/server.log')
+    log_file = 'logs/server.log'
+    file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(log_format))
     
@@ -233,14 +234,8 @@ class YouTubeDownloader:
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
-# Configurar CORS
-CORS(app, resources={
-    r"/*": {
-        "origins": ["*"],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "X-API-Key", "Authorization"]
-    }
-})
+# Configurar CORS - Permitir todo
+CORS(app)
 
 # Configurar rate limiting
 try:
@@ -267,40 +262,6 @@ except Exception as e:
 # Inicializar YouTube Downloader
 youtube = YouTubeDownloader()
 
-# Middleware de autenticación
-def require_api_key(f):
-    """Decorador para requerir API key"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # Obtener API key de headers, query params o JSON body
-        api_key = (
-            request.headers.get('X-API-Key') or
-            request.args.get('api_key') or
-            (request.get_json(silent=True) or {}).get('api_key')
-        )
-        
-        # Validar API key
-        if not api_key:
-            return jsonify({
-                'success': False,
-                'error': 'API key requerida',
-                'code': 'MISSING_API_KEY'
-            }), 401
-        
-        if api_key != Config.API_KEY:
-            return jsonify({
-                'success': False,
-                'error': 'API key inválida',
-                'code': 'INVALID_API_KEY'
-            }), 401
-        
-        # Registrar uso
-        client_ip = request.remote_addr
-        logger.info(f"API key válida usada desde IP: {client_ip}")
-        
-        return f(*args, **kwargs)
-    return decorated_function
-
 # Middleware para logging
 @app.before_request
 def log_request_info():
@@ -309,11 +270,7 @@ def log_request_info():
     
     if request.method == 'POST' and request.is_json:
         data = request.get_json(silent=True) or {}
-        # Ocultar datos sensibles en logs
-        safe_data = data.copy()
-        if 'api_key' in safe_data:
-            safe_data['api_key'] = '***HIDDEN***'
-        logger.debug(f"Request body: {json.dumps(safe_data, ensure_ascii=False)[:500]}")
+        logger.debug(f"Request body: {json.dumps(data, ensure_ascii=False)[:500]}")
 
 @app.after_request
 def log_response_info(response):
@@ -328,7 +285,7 @@ def home():
     """Endpoint principal - Información del servicio"""
     return jsonify({
         'service': 'YouTube Server API',
-        'version': '2.0.0',
+        'version': '3.0.0',
         'status': 'online',
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
@@ -339,7 +296,18 @@ def home():
             '/api/formats': 'Formatos disponibles (POST)',
             '/docs': 'Documentación de la API (GET)'
         },
-        'limits': Config.RATE_LIMIT,
+        'features': [
+            '✅ Sin autenticación requerida',
+            '✅ API pública y gratuita',
+            f'✅ Rate limit: {Config.RATE_LIMIT}',
+            '✅ CORS habilitado para todos los dominios',
+            '✅ Formatos de video y audio',
+            '✅ URL directas para descarga'
+        ],
+        'examples': {
+            'curl_info': 'curl -X POST -H "Content-Type: application/json" -d \'{"url":"https://youtube.com/watch?v=VIDEO_ID"}\' https://api-1-hqvx.onrender.com/api/info',
+            'curl_download': 'curl -X POST -H "Content-Type: application/json" -d \'{"url":"https://youtube.com/watch?v=VIDEO_ID", "format_id":"18"}\' https://api-1-hqvx.onrender.com/api/download'
+        },
         'documentation': 'https://github.com/tu-usuario/youtube-server#readme'
     })
 
@@ -350,9 +318,10 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'service': 'youtube-server',
+        'service': 'youtube-server-public',
         'uptime': 'running',
-        'memory_usage': 'stable'
+        'memory_usage': 'stable',
+        'public_api': True
     })
 
 @app.route('/docs')
@@ -360,21 +329,18 @@ def health_check():
 def api_docs():
     """Documentación básica de la API"""
     return jsonify({
-        'documentation': 'YouTube Server API v2.0',
-        'authentication': {
-            'method': 'API Key',
-            'header': 'X-API-Key',
-            'parameter': 'api_key'
-        },
+        'documentation': 'YouTube Server API v3.0 - PÚBLICA',
+        'note': '⚠️ Esta API es pública y no requiere autenticación',
+        'warning': 'Úsala responsablemente. Rate limit aplicado.',
         'endpoints': [
             {
                 'method': 'POST',
                 'endpoint': '/api/info',
                 'description': 'Obtener información de video',
                 'body': {
-                    'url': 'URL de YouTube (required)',
-                    'api_key': 'Tu API key (required)'
-                }
+                    'url': 'URL de YouTube (required)'
+                },
+                'example': '{"url": "https://youtube.com/watch?v=dQw4w9WgXcQ"}'
             },
             {
                 'method': 'POST',
@@ -383,24 +349,40 @@ def api_docs():
                 'body': {
                     'url': 'URL de YouTube (required)',
                     'format_id': 'ID del formato (opcional, default: best[height<=720])',
-                    'audio_only': 'Solo audio (opcional, boolean)',
-                    'api_key': 'Tu API key (required)'
+                    'audio_only': 'Solo audio (opcional, boolean)'
+                },
+                'example': '{"url": "https://youtube.com/watch?v=dQw4w9WgXcQ", "format_id": "18"}'
+            },
+            {
+                'method': 'POST',
+                'endpoint': '/api/formats',
+                'description': 'Obtener todos los formatos disponibles',
+                'body': {
+                    'url': 'URL de YouTube (required)'
                 }
             }
         ],
-        'examples': {
-            'curl_info': 'curl -X POST -H "Content-Type: application/json" -H "X-API-Key: YOUR_KEY" -d \'{"url":"https://youtube.com/watch?v=VIDEO_ID"}\' https://your-server.onrender.com/api/info',
-            'curl_download': 'curl -X POST -H "Content-Type: application/json" -H "X-API-Key: YOUR_KEY" -d \'{"url":"https://youtube.com/watch?v=VIDEO_ID", "format_id":"22"}\' https://your-server.onrender.com/api/download'
+        'common_format_ids': {
+            'best': 'Mejor calidad disponible',
+            'best[height<=720]': 'Mejor calidad hasta 720p (default)',
+            '18': '360p MP4',
+            '22': '720p MP4',
+            '137': '1080p video only',
+            '140': 'Audio MP4 128k'
+        },
+        'limits': {
+            'rate_limit': Config.RATE_LIMIT,
+            'max_formats': '15 formatos de video, 10 de audio por respuesta',
+            'max_description': '500 caracteres'
         }
     })
 
 @app.route('/api/info', methods=['POST'])
-@require_api_key
 def get_video_info():
     """
     Endpoint: Obtener información detallada del video
     Método: POST
-    Body: { "url": "youtube_url", "api_key": "your_key" }
+    Body: { "url": "youtube_url" }
     """
     try:
         # Obtener y validar datos
@@ -439,12 +421,11 @@ def get_video_info():
         }), 500
 
 @app.route('/api/download', methods=['POST'])
-@require_api_key
 def get_download_url():
     """
     Endpoint: Obtener URL directa para descarga
     Método: POST
-    Body: { "url": "youtube_url", "format_id": "optional", "audio_only": false, "api_key": "your_key" }
+    Body: { "url": "youtube_url", "format_id": "optional", "audio_only": false }
     """
     try:
         # Obtener y validar datos
@@ -485,7 +466,6 @@ def get_download_url():
         }), 500
 
 @app.route('/api/formats', methods=['POST'])
-@require_api_key
 def get_available_formats():
     """Endpoint para obtener todos los formatos disponibles"""
     try:
@@ -556,7 +536,8 @@ def ratelimit_handler(error):
         'success': False,
         'error': 'Demasiadas solicitudes. Por favor, intenta más tarde.',
         'code': 'RATE_LIMIT_EXCEEDED',
-        'retry_after': error.description.get('retry_after', 3600)
+        'retry_after': error.description.get('retry_after', 3600),
+        'limit': Config.RATE_LIMIT
     }), 429
 
 @app.errorhandler(500)
@@ -573,21 +554,22 @@ def internal_error(error):
 if __name__ == '__main__':
     # Mostrar información de inicio
     print("\n" + "="*60)
-    print("🚀 YOUTUBE SERVER API v2.0")
+    print("🚀 YOUTUBE SERVER API v3.0 - PÚBLICA")
     print("="*60)
     print(f"📡 Host: {Config.HOST}")
     print(f"🔌 Puerto: {Config.PORT}")
-    print(f"🔑 API Key: {Config.API_KEY}")
     print(f"📊 Rate Limit: {Config.RATE_LIMIT}")
     print(f"🔧 Debug: {Config.DEBUG}")
+    print("="*60)
+    print("🎯 API PÚBLICA - Sin autenticación requerida")
     print("="*60)
     print("📝 Endpoints disponibles:")
     print("  GET  /           - Información del servicio")
     print("  GET  /health     - Health check")
     print("  GET  /docs       - Documentación API")
-    print("  POST /api/info   - Info de video")
-    print("  POST /api/download - URL de descarga")
-    print("  POST /api/formats - Formatos disponibles")
+    print("  POST /api/info   - Info de video (PÚBLICO)")
+    print("  POST /api/download - URL de descarga (PÚBLICO)")
+    print("  POST /api/formats - Formatos disponibles (PÚBLICO)")
     print("="*60)
     print("✅ Servidor listo. Presiona Ctrl+C para detener.\n")
     
@@ -601,7 +583,7 @@ if __name__ == '__main__':
             threaded=True
         )
     else:
-        # Modo producción (con gunicorn si está disponible)
+        # Modo producción
         try:
             from waitress import serve
             print("⚡ Usando Waitress para producción")
