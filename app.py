@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🚀 SERVIDOR YOUTUBE/TIKTOK PARA RENDER.COM
-Versión: 1.0 - Simple y Funcional
+🚀 SERVIDOR YOUTUBE/TIKTOK PARA RENDER.COM - FIXED
+Versión: 1.1 - Corregido para Render
 """
 
 import os
@@ -11,6 +11,8 @@ import logging
 import random
 import time
 import threading
+import tempfile
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -30,15 +32,14 @@ class Config:
     TEMP_DIR = '/tmp/youtube_downloads'
     
     # Límites para evitar problemas en free tier
-    MAX_FILE_SIZE = 300 * 1024 * 1024  # 300MB máximo
-    MAX_WORKERS = 2
-    TIMEOUT = 180  # 3 minutos máximo por descarga
+    MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB máximo (más seguro)
+    TIMEOUT = 120  # 2 minutos máximo por descarga
     
     # User-Agents para rotar
     USER_AGENTS = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     ]
 
 # ==============================
@@ -47,7 +48,7 @@ class Config:
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
     return logging.getLogger(__name__)
@@ -63,38 +64,62 @@ class SimpleDownloader:
     def __init__(self, url, download_type="best"):
         self.url = url
         self.download_type = download_type
-        self.temp_dir = Config.TEMP_DIR
         
-        # Crear directorio temporal
-        os.makedirs(self.temp_dir, exist_ok=True)
+        # Crear directorio temporal único
+        self.temp_dir = tempfile.mkdtemp(prefix="ytdl_", dir="/tmp")
         
         # Estado
         self.status = "pending"
         self.error = None
         self.filename = None
+        self.video_info = None
         
         logger.info(f"Iniciando descarga: {url[:50]}...")
     
+    def __del__(self):
+        """Destructor para limpiar archivos temporales"""
+        try:
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+        except:
+            pass
+    
     def clean_filename(self, name):
         """Limpia caracteres inválidos del nombre"""
+        if not name:
+            return "video"
+        
         invalid = '<>:"/\\|?*'
         for char in invalid:
             name = name.replace(char, '_')
-        return name[:80]
+        
+        # Limitar longitud
+        if len(name) > 80:
+            name = name[:77] + "..."
+        
+        return name
     
-    def get_info(self):
+    def get_video_info(self):
         """Obtiene información básica del video"""
         try:
             opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
-                'socket_timeout': 15,
-                'retries': 3,
+                'socket_timeout': 10,
+                'retries': 2,
                 'ignoreerrors': True,
+                'no_check_certificate': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'web']
+                    }
+                },
                 'http_headers': {
                     'User-Agent': random.choice(Config.USER_AGENTS),
-                    'Accept': '*/*',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate',
                 }
             }
             
@@ -103,6 +128,9 @@ class SimpleDownloader:
                 
                 if not info:
                     return {'success': False, 'error': 'Video no encontrado'}
+                
+                # Guardar información para usar después
+                self.video_info = info
                 
                 # Formato simple
                 formats = []
@@ -113,17 +141,26 @@ class SimpleDownloader:
                             'ext': fmt.get('ext', ''),
                             'quality': fmt.get('height', 0),
                             'size': fmt.get('filesize', 0),
+                            'format_note': fmt.get('format_note', ''),
                         })
                 
-                # Ordenar por calidad
-                formats.sort(key=lambda x: x['quality'], reverse=True)
+                # Ordenar por calidad y filtrar duplicados
+                seen = set()
+                unique_formats = []
+                for fmt in sorted(formats, key=lambda x: x['quality'], reverse=True):
+                    key = (fmt['quality'], fmt['ext'])
+                    if key not in seen:
+                        seen.add(key)
+                        unique_formats.append(fmt)
                 
                 return {
                     'success': True,
                     'title': info.get('title', 'Video'),
                     'duration': info.get('duration', 0),
                     'thumbnail': info.get('thumbnail', ''),
-                    'formats': formats[:5],
+                    'uploader': info.get('uploader', ''),
+                    'view_count': info.get('view_count', 0),
+                    'formats': unique_formats[:8],
                 }
                 
         except Exception as e:
@@ -138,17 +175,20 @@ class SimpleDownloader:
         try:
             # Configurar opciones según tipo
             opts = {
-                'outtmpl': f'{self.temp_dir}/%(id)s.%(ext)s',
+                'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
                 'quiet': True,
                 'no_warnings': True,
                 'socket_timeout': 30,
-                'retries': 5,
-                'fragment_retries': 5,
+                'retries': 3,
+                'fragment_retries': 3,
                 'ignoreerrors': True,
+                'no_check_certificate': True,
                 'http_headers': {
                     'User-Agent': random.choice(Config.USER_AGENTS),
                     'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
                 },
+                'concurrent_fragment_downloads': 4,  # Reducido para Render
             }
             
             if self.download_type == "audio":
@@ -157,148 +197,105 @@ class SimpleDownloader:
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
-                    }]
+                        'preferredquality': '192',
+                    }],
+                    'extractaudio': True,
+                    'audioformat': 'mp3',
                 })
-            else:
+            elif self.download_type == "video":
                 # Para video, limitar tamaño y calidad
-                opts['format'] = 'best[filesize<50M][height<=720]'
+                opts['format'] = 'best[height<=480][filesize<50M]/best[height<=720]'
+            else:
+                # Modo best: intentar calidad media
+                opts['format'] = 'best[height<=720][filesize<100M]/best'
             
-            # Descargar
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.url, download=True)
-                
-                if not info:
-                    self.status = "failed"
-                    return {'success': False, 'error': 'No se pudo descargar'}
-                
-                # Encontrar archivo descargado
-                video_id = info.get('id', 'video')
-                for file in os.listdir(self.temp_dir):
-                    if file.startswith(video_id):
-                        self.filename = file
-                        break
-                
-                if not self.filename:
-                    self.status = "failed"
-                    return {'success': False, 'error': 'Archivo no encontrado'}
-                
-                filepath = f'{self.temp_dir}/{self.filename}'
-                filesize = os.path.getsize(filepath)
-                
-                # Verificar tamaño máximo
-                if filesize > Config.MAX_FILE_SIZE:
-                    os.remove(filepath)
-                    self.status = "failed"
+            # Descargar con timeout
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Tiempo de descarga excedido")
+            
+            # Configurar timeout
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(Config.TIMEOUT)
+            
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=True)
+                    
+                    if not info:
+                        self.status = "failed"
+                        return {'success': False, 'error': 'No se pudo descargar'}
+                    
+                    # Buscar archivo descargado en el directorio temporal
+                    downloaded_files = os.listdir(self.temp_dir)
+                    if not downloaded_files:
+                        self.status = "failed"
+                        return {'success': False, 'error': 'No se generó archivo'}
+                    
+                    self.filename = downloaded_files[0]
+                    filepath = os.path.join(self.temp_dir, self.filename)
+                    
+                    # Verificar que el archivo existe y tiene tamaño
+                    if not os.path.exists(filepath):
+                        self.status = "failed"
+                        return {'success': False, 'error': 'Archivo no encontrado'}
+                    
+                    filesize = os.path.getsize(filepath)
+                    if filesize == 0:
+                        self.status = "failed"
+                        os.remove(filepath)
+                        return {'success': False, 'error': 'Archivo vacío'}
+                    
+                    # Verificar tamaño máximo
+                    if filesize > Config.MAX_FILE_SIZE:
+                        os.remove(filepath)
+                        self.status = "failed"
+                        return {
+                            'success': False, 
+                            'error': f'Archivo muy grande ({filesize//1024//1024}MB > {Config.MAX_FILE_SIZE//1024//1024}MB)'
+                        }
+                    
+                    self.status = "completed"
+                    download_time = time.time() - start_time
+                    
                     return {
-                        'success': False, 
-                        'error': f'Archivo muy grande ({filesize//1024//1024}MB > {Config.MAX_FILE_SIZE//1024//1024}MB)'
+                        'success': True,
+                        'filename': self.filename,
+                        'filepath': filepath,
+                        'filesize': filesize,
+                        'download_time': download_time,
+                        'title': info.get('title', 'Video'),
+                        'temp_dir': self.temp_dir,
                     }
-                
-                # Renombrar con título
-                try:
-                    title = info.get('title', 'video')
-                    safe_title = self.clean_filename(title)
-                    ext = os.path.splitext(self.filename)[1]
-                    new_name = f"{safe_title}{ext}"
-                    new_path = f'{self.temp_dir}/{new_name}'
                     
-                    # Evitar colisiones
-                    counter = 1
-                    while os.path.exists(new_path):
-                        new_name = f"{safe_title}_{counter}{ext}"
-                        new_path = f'{self.temp_dir}/{new_name}'
-                        counter += 1
-                    
-                    os.rename(filepath, new_path)
-                    self.filename = new_name
-                    filepath = new_path
-                except:
-                    pass  # Si falla el renombrado, continuar
+            finally:
+                # Cancelar alarm
+                signal.alarm(0)
                 
-                self.status = "completed"
-                download_time = time.time() - start_time
-                
-                return {
-                    'success': True,
-                    'filename': self.filename,
-                    'filepath': filepath,
-                    'filesize': filesize,
-                    'download_time': download_time,
-                    'title': info.get('title', 'Video'),
-                }
-                
+        except TimeoutError as e:
+            self.status = "failed"
+            self.error = str(e)
+            return {'success': False, 'error': 'Tiempo de descarga excedido (2 minutos)'}
         except Exception as e:
             self.status = "failed"
             self.error = str(e)
             logger.error(f"Error en descarga: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def cleanup(self):
-        """Limpia el archivo"""
-        if self.filename:
-            try:
-                filepath = f'{self.temp_dir}/{self.filename}'
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                    return True
-            except:
-                pass
-        return False
+            return {'success': False, 'error': f'Error: {str(e)}'}
+        finally:
+            # Limpiar si hay error
+            if self.status == "failed":
+                try:
+                    if os.path.exists(self.temp_dir):
+                        shutil.rmtree(self.temp_dir)
+                except:
+                    pass
 
 # ==============================
-# SISTEMA DE LIMPIEZA
-# ==============================
-class CleanupSystem:
-    """Limpia archivos antiguos automáticamente"""
-    
-    def __init__(self):
-        self.temp_dir = Config.TEMP_DIR
-        self.running = True
-        self.thread = threading.Thread(target=self.cleanup_loop, daemon=True)
-        self.thread.start()
-        logger.info("Sistema de limpieza iniciado")
-    
-    def cleanup_loop(self):
-        """Loop de limpieza cada 5 minutos"""
-        while self.running:
-            try:
-                time.sleep(300)  # 5 minutos
-                
-                if not os.path.exists(self.temp_dir):
-                    continue
-                
-                # Eliminar archivos con más de 1 hora
-                cutoff = time.time() - 3600
-                deleted = 0
-                
-                for file in os.listdir(self.temp_dir):
-                    filepath = f'{self.temp_dir}/{file}'
-                    try:
-                        if os.path.isfile(filepath):
-                            if os.path.getmtime(filepath) < cutoff:
-                                os.remove(filepath)
-                                deleted += 1
-                    except:
-                        pass
-                
-                if deleted > 0:
-                    logger.info(f"Limpieza: {deleted} archivos eliminados")
-                    
-            except Exception as e:
-                logger.error(f"Error en limpieza: {e}")
-    
-    def stop(self):
-        """Detiene el sistema de limpieza"""
-        self.running = False
-
-# ==============================
-# INICIALIZAR FLASK
+# INICIALIZAR FLASK APP
 # ==============================
 app = Flask(__name__)
 CORS(app)  # Permitir CORS para todos los orígenes
-
-# Iniciar sistema de limpieza
-cleanup_system = CleanupSystem()
 
 # ==============================
 # ENDPOINTS DE LA API
@@ -308,20 +305,23 @@ cleanup_system = CleanupSystem()
 def home():
     """Página principal"""
     return jsonify({
-        'service': 'YouTube/TikTok Downloader',
-        'version': '1.0',
+        'service': 'YouTube/TikTok Downloader API',
+        'version': '1.1',
         'status': 'online',
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
             '/': 'Esta página',
-            '/health': 'Estado del servidor',
-            '/info': 'Información de video (POST)',
-            '/download': 'Descargar video (POST)',
-            '/file/<name>': 'Obtener archivo (GET)',
+            '/health': 'Health check',
+            '/info': 'Obtener información de video (POST)',
+            '/download': 'Descargar video/audio (POST)',
         },
         'limits': {
-            'max_size': '300MB',
-            'timeout': '3 minutos',
+            'max_file_size': f'{Config.MAX_FILE_SIZE // 1024 // 1024}MB',
+            'timeout': f'{Config.TIMEOUT} segundos',
+        },
+        'usage': {
+            'info': 'POST /info {"url": "youtube_url"}',
+            'download': 'POST /download {"url": "youtube_url", "type": "video|audio|best"}',
         }
     })
 
@@ -330,7 +330,9 @@ def health():
     """Health check para Render"""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'service': 'youtube-downloader',
+        'environment': os.environ.get('RENDER', 'development'),
     })
 
 @app.route('/info', methods=['POST'])
@@ -338,52 +340,57 @@ def get_video_info():
     """Obtiene información de un video"""
     try:
         # Obtener datos
-        if request.is_json:
-            data = request.get_json()
-        else:
-            data = request.form
+        data = request.get_json(silent=True) or request.form
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No se recibieron datos'}), 400
         
         url = data.get('url')
         
         if not url:
-            return jsonify({'error': 'Se requiere URL'}), 400
+            return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
         
         # Validar URL
-        if not ('youtube.com' in url or 'youtu.be' in url or 'tiktok.com' in url):
-            return jsonify({'error': 'URL no válida'}), 400
+        if not any(domain in url.lower() for domain in ['youtube.com', 'youtu.be', 'tiktok.com', 'vm.tiktok.com']):
+            return jsonify({'success': False, 'error': 'URL no válida. Solo YouTube y TikTok'}), 400
         
         # Obtener información
         downloader = SimpleDownloader(url)
-        result = downloader.get_info()
+        result = downloader.get_video_info()
         
         return jsonify(result)
         
     except Exception as e:
         logger.error(f"Error en /info: {e}")
-        return jsonify({'error': 'Error interno'}), 500
+        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
 @app.route('/download', methods=['POST'])
 def download_video():
     """Descarga un video/audio"""
     try:
         # Obtener datos
-        if request.is_json:
-            data = request.get_json()
-        else:
-            data = request.form
+        data = request.get_json(silent=True) or request.form
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No se recibieron datos'}), 400
         
         url = data.get('url')
         download_type = data.get('type', 'best')
         
         if not url:
-            return jsonify({'error': 'Se requiere URL'}), 400
+            return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
         
         # Validar tipo
         if download_type not in ['video', 'audio', 'best']:
-            return jsonify({'error': 'Tipo debe ser: video, audio o best'}), 400
+            return jsonify({'success': False, 'error': 'Tipo debe ser: video, audio o best'}), 400
         
         # Crear descargador
         downloader = SimpleDownloader(url, download_type)
+        
+        # Obtener información primero (para validar)
+        info = downloader.get_video_info()
+        if not info.get('success'):
+            return jsonify(info), 400
         
         # Descargar
         result = downloader.download()
@@ -394,65 +401,75 @@ def download_video():
         # Crear respuesta de descarga
         filepath = result['filepath']
         filename = result['filename']
+        filesize = result['filesize']
         
+        # Función para stream del archivo
         def generate():
-            with open(filepath, 'rb') as f:
-                while chunk := f.read(8192):
-                    yield chunk
-            
-            # Limpiar después de enviar
             try:
-                os.remove(filepath)
-            except:
-                pass
+                with open(filepath, 'rb') as f:
+                    while chunk := f.read(8192):
+                        yield chunk
+            finally:
+                # Limpiar archivo temporal después de enviar
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    # Limpiar directorio temporal
+                    temp_dir = result.get('temp_dir')
+                    if temp_dir and os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                except Exception as e:
+                    logger.error(f"Error limpiando archivos: {e}")
+        
+        # Determinar tipo MIME
+        if filename.lower().endswith('.mp4'):
+            mimetype = 'video/mp4'
+        elif filename.lower().endswith('.mp3'):
+            mimetype = 'audio/mpeg'
+        else:
+            mimetype = 'application/octet-stream'
         
         return Response(
             generate(),
-            mimetype='application/octet-stream',
+            mimetype=mimetype,
             headers={
                 'Content-Disposition': f'attachment; filename="{filename}"',
-                'Content-Length': str(result['filesize'])
+                'Content-Length': str(filesize),
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0',
             }
         )
         
     except Exception as e:
         logger.error(f"Error en /download: {e}")
-        return jsonify({'error': 'Error interno'}), 500
+        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
-@app.route('/file/<filename>', methods=['GET'])
-def get_file(filename):
-    """Obtiene un archivo descargado (alternativa)"""
-    try:
-        # Prevenir path traversal
-        if '..' in filename or '/' in filename or '\\' in filename:
-            return jsonify({'error': 'Nombre de archivo inválido'}), 400
-        
-        filepath = f'{Config.TEMP_DIR}/{filename}'
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'Archivo no encontrado'}), 404
-        
-        return send_file(
-            filepath,
-            as_attachment=True,
-            download_name=filename
-        )
-        
-    except Exception as e:
-        logger.error(f"Error en /file: {e}")
-        return jsonify({'error': 'Error interno'}), 500
+@app.route('/test', methods=['GET'])
+def test_endpoint():
+    """Endpoint de prueba"""
+    return jsonify({
+        'success': True,
+        'message': 'Servidor funcionando correctamente',
+        'timestamp': datetime.now().isoformat(),
+        'python_version': sys.version,
+    })
 
 # ==============================
 # MANEJO DE ERRORES
 # ==============================
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'error': 'Endpoint no encontrado'}), 404
+    return jsonify({'success': False, 'error': 'Endpoint no encontrado'}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({'success': False, 'error': 'Método no permitido'}), 405
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Error 500: {error}")
-    return jsonify({'error': 'Error interno del servidor'}), 500
+    return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
 # ==============================
 # INICIALIZACIÓN
@@ -462,24 +479,20 @@ if __name__ == '__main__':
     print("\n" + "="*60)
     print("🚀 SERVIDOR YOUTUBE/TIKTOK - LISTO PARA RENDER")
     print("="*60)
-    print(f"📡 Puerto: {Config.PORT}")
-    print(f"💾 Directorio temporal: {Config.TEMP_DIR}")
+    print(f"📡 Host: {Config.HOST}")
+    print(f"🔌 Puerto: {Config.PORT}")
     print(f"📦 Tamaño máximo: {Config.MAX_FILE_SIZE//1024//1024}MB")
+    print(f"⏱️  Timeout: {Config.TIMEOUT} segundos")
     print("="*60)
-    print("✅ Sistema de limpieza automática activado")
+    print("✅ Usando Flask development server")
     print("✅ CORS habilitado para todos los orígenes")
-    print("✅ Timeout: 3 minutos por descarga")
+    print("✅ Sistema de limpieza automática de archivos")
     print("="*60)
     
-    # Asegurar directorio temporal
-    os.makedirs(Config.TEMP_DIR, exist_ok=True)
-    
-    # Usar waitress en lugar de gunicorn
-    try:
-        from waitress import serve
-        print("⚡ Usando Waitress para producción")
-        serve(app, host=Config.HOST, port=Config.PORT, threads=4)
-    except ImportError:
-        print("⚠️ Waitress no disponible, usando Flask server")
-        app.run(host=Config.HOST, port=Config.PORT, debug=False)
-
+    # Iniciar servidor
+    app.run(
+        host=Config.HOST,
+        port=Config.PORT,
+        debug=False,
+        threaded=True
+    )
