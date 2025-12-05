@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 8.0
-Versión: 8.0 - Correcciones para TikTok y YouTube con yt-dlp actualizado
+🚀 SERVIDOR YOUTUBE/TIKTOK PARA RENDER.COM
+Versión: Actualizada - Compatible con yt-dlp 2025.05.22
 """
 
 import os
@@ -12,7 +12,6 @@ import tempfile
 import shutil
 import time
 import re
-import subprocess
 from datetime import datetime
 from typing import Dict, Any
 
@@ -27,7 +26,7 @@ class Config:
     PORT = int(os.environ.get('PORT', 10000))
     HOST = '0.0.0.0'
     MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
-    TIMEOUT = 180  # 3 minutos
+    TIMEOUT = 300  # 5 minutos para descargas largas
 
 # ==============================
 # SETUP DE LOGGING
@@ -44,85 +43,45 @@ def setup_logging():
 logger = setup_logging()
 
 # ==============================
-# ACTUALIZAR YT-DLP AL INICIAR
+# MÉTODO ACTUALIZADO DE DESCARGA
 # ==============================
-def update_ytdlp():
-    """Actualiza yt-dlp a la última versión"""
-    try:
-        logger.info("🔄 Comprobando actualización de yt-dlp...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"])
-        logger.info("✅ yt-dlp actualizado correctamente")
-    except Exception as e:
-        logger.warning(f"⚠️ No se pudo actualizar yt-dlp: {e}")
-
-# Actualizar al inicio
-update_ytdlp()
-
-# ==============================
-# MÉTODO CORREGIDO DE DESCARGA
-# ==============================
-class FixedDownloader:
-    """Descargador con correcciones para TikTok y YouTube"""
+class ModernDownloader:
+    """Descargador compatible con yt-dlp 2025.05.22"""
     
     def __init__(self):
         self.temp_dir = None
         self.output_path = None
         
     def sanitize_filename(self, filename):
-        """Limpia el nombre de archivo de caracteres inválidos"""
+        """Limpia caracteres inválidos del nombre de archivo"""
+        # Eliminar caracteres no seguros para nombres de archivo
         invalid_chars = '<>:"/\\|?*'
         for char in invalid_chars:
             filename = filename.replace(char, '_')
+        
+        # Limitar longitud
         if len(filename) > 100:
             filename = filename[:100]
-        return filename
+        
+        return filename.strip()
     
     def get_info(self, url: str) -> Dict[str, Any]:
-        """Obtiene información del video con configuración robusta"""
+        """Obtiene información del video"""
         try:
-            # Configuración común para todas las plataformas
+            # Configuración simplificada para yt-dlp 2025
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
                 'extract_flat': False,
-                'forcejson': True,
                 'no_check_certificate': True,
                 'ignoreerrors': True,
-                'socket_timeout': 15,
-                'retries': 5,
-                'fragment_retries': 5,
+                'socket_timeout': 10,
                 'http_headers': {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
                 }
             }
-            
-            # Configuración específica para TikTok
-            if 'tiktok.com' in url:
-                ydl_opts.update({
-                    'extractor_args': {
-                        'tiktok': {
-                            'app_version': '30.2.0',
-                            'manifest_app_version': '30.2.0',
-                        }
-                    }
-                })
-            # Configuración específica para YouTube
-            elif 'youtube.com' in url or 'youtu.be' in url:
-                ydl_opts.update({
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['android', 'web'],
-                            'player_skip': ['configs', 'js'],
-                        }
-                    }
-                })
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -141,6 +100,9 @@ class FixedDownloader:
                 else:
                     duration_str = f"{minutes:02d}:{seconds:02d}"
                 
+                # Determinar plataforma
+                platform = 'YouTube' if any(x in url.lower() for x in ['youtube.com', 'youtu.be']) else 'TikTok'
+                
                 return {
                     'success': True,
                     'title': info.get('title', 'Video sin título'),
@@ -149,114 +111,95 @@ class FixedDownloader:
                     'uploader': info.get('uploader', 'Desconocido'),
                     'view_count': info.get('view_count', 0),
                     'thumbnail': info.get('thumbnail', ''),
-                    'platform': 'TikTok' if 'tiktok.com' in url else 'YouTube'
+                    'platform': platform,
+                    'url': url
                 }
                 
         except yt_dlp.utils.DownloadError as e:
             logger.error(f"Error específico obteniendo info: {e}")
-            return {'success': False, 'error': f'Error del servicio: {str(e)}'}
+            return {'success': False, 'error': f'Error del servicio: {str(e)[:100]}'}
         except Exception as e:
             logger.error(f"Error obteniendo info: {e}")
-            return {'success': False, 'error': f'Error: {str(e)}'}
-    
-    def _get_download_options(self, url: str, download_type: str):
-        """Obtiene opciones de descarga específicas para la URL y tipo"""
-        # Opciones base comunes
-        base_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'no_color': True,
-            'noprogress': True,
-            'no_check_certificate': True,
-            'ignoreerrors': True,
-            'socket_timeout': 30,
-            'retries': 10,
-            'fragment_retries': 10,
-            'concurrent_fragment_downloads': 4,
-            'buffersize': 1024 * 1024,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-            },
-        }
-        
-        # Configuración específica para TikTok
-        if 'tiktok.com' in url:
-            base_opts.update({
-                'extractor_args': {
-                    'tiktok': {
-                        'app_version': '30.2.0',
-                        'manifest_app_version': '30.2.0',
-                    }
-                }
-            })
-        # Configuración específica para YouTube
-        elif 'youtube.com' in url or 'youtu.be' in url:
-            base_opts.update({
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'web'],
-                        'player_skip': ['configs', 'js'],
-                    }
-                }
-            })
-        
-        # Configuración según el tipo de descarga
-        if download_type == "audio":
-            base_opts.update({
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'keepvideo': False,
-            })
-        elif download_type == "video":
-            base_opts.update({
-                'format': 'best[ext=mp4]/best',
-                'merge_output_format': 'mp4',
-            })
-        else:  # "best"
-            base_opts.update({
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                'merge_output_format': 'mp4',
-            })
-        
-        return base_opts
+            return {'success': False, 'error': f'Error: {str(e)[:100]}'}
     
     def download(self, url: str, download_type: str = "best") -> Dict[str, Any]:
-        """MÉTODO CORREGIDO - Descarga con configuración robusta"""
-        self.temp_dir = tempfile.mkdtemp(prefix="ytdl_", dir="/tmp")
+        """Descarga el video/audio"""
+        self.temp_dir = tempfile.mkdtemp(prefix="ytdl_")
         start_time = time.time()
         
         try:
-            timestamp = int(time.time())
-            base_filename = f"download_{timestamp}"
+            # Configuración base para yt-dlp 2025
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'no_color': True,
+                'noprogress': True,
+                'no_check_certificate': True,
+                'ignoreerrors': True,
+                'socket_timeout': 30,
+                'retries': 10,
+                'fragment_retries': 10,
+                'concurrent_fragment_downloads': 4,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                },
+            }
             
-            # Configurar opciones de descarga
-            ydl_opts = self._get_download_options(url, download_type)
-            ydl_opts['outtmpl'] = os.path.join(self.temp_dir, f'{base_filename}.%(ext)s')
+            # Configuración específica para TikTok
+            if 'tiktok.com' in url:
+                ydl_opts.update({
+                    'extractor_args': {
+                        'tiktok': {
+                            'app_version': '33.4.4',
+                            'manifest_app_version': '33.4.4',
+                        }
+                    }
+                })
+            
+            # Configuración según tipo de descarga
+            if download_type == "audio":
+                ydl_opts.update({
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'keepvideo': False,
+                    'outtmpl': os.path.join(self.temp_dir, 'audio.%(ext)s'),
+                })
+            elif download_type == "video":
+                ydl_opts.update({
+                    'format': 'best[ext=mp4]/best',
+                    'merge_output_format': 'mp4',
+                    'outtmpl': os.path.join(self.temp_dir, 'video.%(ext)s'),
+                })
+            else:  # "best"
+                ydl_opts.update({
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'merge_output_format': 'mp4',
+                    'outtmpl': os.path.join(self.temp_dir, 'video.%(ext)s'),
+                })
             
             logger.info(f"Iniciando descarga: {url} - Tipo: {download_type}")
             
-            # Realizar la descarga
+            # Realizar descarga
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                
-                if not info:
-                    return {'success': False, 'error': 'No se pudo procesar el video'}
+                title = info.get('title', 'video') if info else 'video'
             
             # Buscar archivo descargado
             downloaded_files = []
             for root, dirs, files in os.walk(self.temp_dir):
                 for file in files:
-                    if file.endswith(('.part', '.ytdl')):
-                        continue  # Ignorar archivos parciales
+                    if file.endswith(('.part', '.ytdl', '.tmp')):
+                        continue  # Ignorar archivos temporales
+                    
                     filepath = os.path.join(root, file)
                     try:
                         file_size = os.path.getsize(filepath)
@@ -268,7 +211,7 @@ class FixedDownloader:
             if not downloaded_files:
                 return {'success': False, 'error': 'No se generó ningún archivo válido'}
             
-            # Seleccionar el archivo más grande
+            # Tomar el archivo más grande
             self.output_path, file_size = max(downloaded_files, key=lambda x: x[1])
             
             if file_size == 0:
@@ -276,27 +219,18 @@ class FixedDownloader:
             
             if file_size > Config.MAX_FILE_SIZE:
                 os.remove(self.output_path)
-                return {'success': False, 'error': f'Archivo demasiado grande ({file_size/(1024*1024):.2f}MB > 200MB)'}
+                return {'success': False, 'error': f'Archivo demasiado grande ({file_size/(1024*1024):.2f}MB)'}
             
-            # Renombrar archivo con título del video
-            video_title = info.get('title', 'video') if info else 'video'
-            safe_title = self.sanitize_filename(video_title)
-            
+            # Renombrar archivo
+            safe_title = self.sanitize_filename(title)
             file_ext = os.path.splitext(self.output_path)[1].lower()
+            
             if download_type == "audio":
                 if file_ext != '.mp3':
                     new_filename = f"{safe_title}.mp3"
                     new_path = os.path.join(self.temp_dir, new_filename)
-                    # Si ya existe un archivo MP3, usarlo
-                    for f, _ in downloaded_files:
-                        if f.lower().endswith('.mp3'):
-                            self.output_path = f
-                            file_ext = '.mp3'
-                            break
-                    else:
-                        # Si no hay MP3, renombrar el archivo actual
-                        os.rename(self.output_path, new_path)
-                        self.output_path = new_path
+                    os.rename(self.output_path, new_path)
+                    self.output_path = new_path
                 else:
                     new_filename = f"{safe_title}.mp3"
                     new_path = os.path.join(self.temp_dir, new_filename)
@@ -304,21 +238,18 @@ class FixedDownloader:
                     self.output_path = new_path
             else:  # video o best
                 if file_ext != '.mp4':
-                    # Buscar si hay un MP4
-                    mp4_files = [(f, s) for f, s in downloaded_files if f.lower().endswith('.mp4')]
-                    if mp4_files:
-                        self.output_path, file_size = max(mp4_files, key=lambda x: x[1])
-                        file_ext = '.mp4'
-                    
-                    new_filename = f"{safe_title}.mp4"
-                    new_path = os.path.join(self.temp_dir, new_filename)
-                    os.rename(self.output_path, new_path)
-                    self.output_path = new_path
-                else:
-                    new_filename = f"{safe_title}.mp4"
-                    new_path = os.path.join(self.temp_dir, new_filename)
-                    os.rename(self.output_path, new_path)
-                    self.output_path = new_path
+                    # Buscar si hay MP4 en los archivos descargados
+                    for f, _ in downloaded_files:
+                        if f.lower().endswith('.mp4'):
+                            self.output_path = f
+                            file_size = os.path.getsize(f)
+                            file_ext = '.mp4'
+                            break
+                
+                new_filename = f"{safe_title}.mp4"
+                new_path = os.path.join(self.temp_dir, new_filename)
+                os.rename(self.output_path, new_path)
+                self.output_path = new_path
             
             download_time = time.time() - start_time
             
@@ -329,99 +260,20 @@ class FixedDownloader:
                 'filesize': file_size,
                 'filesize_mb': round(file_size / (1024 * 1024), 2),
                 'download_time': round(download_time, 2),
-                'title': video_title,
+                'title': title,
                 'temp_dir': self.temp_dir,
                 'type': download_type,
-                'platform': 'TikTok' if 'tiktok.com' in url else 'YouTube'
+                'platform': 'YouTube' if any(x in url.lower() for x in ['youtube.com', 'youtu.be']) else 'TikTok'
             }
                 
         except yt_dlp.utils.DownloadError as e:
             error_msg = str(e)
             logger.error(f"Error de descarga: {error_msg}")
-            
-            # Intentar método alternativo
-            return self._alternative_method(url, download_type, start_time)
+            return {'success': False, 'error': f'Error de descarga: {error_msg[:100]}'}
             
         except Exception as e:
             logger.error(f"Error inesperado: {e}", exc_info=True)
-            return {'success': False, 'error': f'Error interno: {str(e)}'}
-    
-    def _alternative_method(self, url: str, download_type: str, start_time: float) -> Dict[str, Any]:
-        """Método alternativo simplificado"""
-        try:
-            logger.info("Intentando método alternativo...")
-            
-            # Configuración mínima y directa
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
-                'no_check_certificate': True,
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                },
-            }
-            
-            # Formato específico
-            if 'tiktok.com' in url:
-                ydl_opts['format'] = 'download_addr'
-            elif download_type == "audio":
-                ydl_opts['format'] = 'bestaudio'
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                }]
-            else:
-                ydl_opts['format'] = 'best[ext=mp4]'
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-            
-            # Buscar archivos
-            for root, dirs, files in os.walk(self.temp_dir):
-                for file in files:
-                    if file.endswith(('.mp4', '.mp3', '.webm', '.m4a')):
-                        filepath = os.path.join(root, file)
-                        file_size = os.path.getsize(filepath)
-                        
-                        if file_size > 1024:
-                            download_time = time.time() - start_time
-                            
-                            # Renombrar si es necesario
-                            video_title = info.get('title', 'video') if info else 'video'
-                            safe_title = self.sanitize_filename(video_title)
-                            file_ext = os.path.splitext(filepath)[1]
-                            
-                            if download_type == "audio" and not file_ext.lower().endswith('.mp3'):
-                                new_filename = f"{safe_title}.mp3"
-                                new_path = os.path.join(self.temp_dir, new_filename)
-                                os.rename(filepath, new_path)
-                                filepath = new_path
-                            elif download_type == "video" and not file_ext.lower().endswith('.mp4'):
-                                new_filename = f"{safe_title}.mp4"
-                                new_path = os.path.join(self.temp_dir, new_filename)
-                                os.rename(filepath, new_path)
-                                filepath = new_path
-                            
-                            self.output_path = filepath
-                            
-                            return {
-                                'success': True,
-                                'filename': os.path.basename(filepath),
-                                'filepath': filepath,
-                                'filesize': file_size,
-                                'filesize_mb': round(file_size / (1024 * 1024), 2),
-                                'download_time': round(download_time, 2),
-                                'title': video_title,
-                                'temp_dir': self.temp_dir,
-                                'type': download_type
-                            }
-            
-            return {'success': False, 'error': 'Método alternativo no generó archivos'}
-                
-        except Exception as e:
-            logger.error(f"Error en método alternativo: {e}")
-            return {'success': False, 'error': 'Todos los métodos fallaron'}
+            return {'success': False, 'error': f'Error interno: {str(e)[:100]}'}
     
     def cleanup(self):
         """Limpia archivos temporales"""
@@ -445,10 +297,10 @@ CORS(app)
 def home():
     """Página principal"""
     return jsonify({
-        'service': 'YouTube/TikTok Downloader',
-        'version': '8.0',
+        'service': 'YouTube/TikTok Downloader API',
+        'version': '2025.05.22',
         'status': 'online',
-        'features': 'Corregido para TikTok y YouTube',
+        'ytdlp_version': yt_dlp.version.__version__,
         'endpoints': {
             '/health': 'GET - Health check',
             '/info': 'POST {"url": "video_url"}',
@@ -463,7 +315,8 @@ def health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'ytdlp_version': yt_dlp.version.__version__ if hasattr(yt_dlp, 'version') else 'unknown'
+        'ytdlp_version': yt_dlp.version.__version__,
+        'python_version': sys.version
     })
 
 @app.route('/info', methods=['POST', 'GET'])
@@ -480,19 +333,11 @@ def get_info():
         if not url:
             return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
         
-        # Validar URL
-        patterns = [
-            r'https?://(www\.)?tiktok\.com/',
-            r'https?://vm\.tiktok\.com/',
-            r'https?://vt\.tiktok\.com/',
-            r'https?://(www\.)?youtube\.com/',
-            r'https?://youtu\.be/'
-        ]
+        # Validar URL básica
+        if not ('tiktok.com' in url or 'youtube.com' in url or 'youtu.be' in url):
+            return jsonify({'success': False, 'error': 'URL no válida. Solo YouTube o TikTok'}), 400
         
-        if not any(re.match(pattern, url) for pattern in patterns):
-            return jsonify({'success': False, 'error': 'URL no válida. Solo se admiten TikTok o YouTube'}), 400
-        
-        downloader = FixedDownloader()
+        downloader = ModernDownloader()
         result = downloader.get_info(url)
         downloader.cleanup()
         
@@ -504,7 +349,7 @@ def get_info():
 
 @app.route('/download', methods=['POST'])
 def download():
-    """Endpoint de descarga principal - CORREGIDO"""
+    """Endpoint de descarga principal"""
     try:
         data = request.get_json(silent=True) or request.form
         
@@ -517,17 +362,9 @@ def download():
         if not url:
             return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
         
-        # Validar URL
-        patterns = [
-            r'https?://(www\.)?tiktok\.com/',
-            r'https?://vm\.tiktok\.com/',
-            r'https?://vt\.tiktok\.com/',
-            r'https?://(www\.)?youtube\.com/',
-            r'https?://youtu\.be/'
-        ]
-        
-        if not any(re.match(pattern, url) for pattern in patterns):
-            return jsonify({'success': False, 'error': 'URL no válida. Solo se admiten TikTok o YouTube'}), 400
+        # Validar URL básica
+        if not ('tiktok.com' in url or 'youtube.com' in url or 'youtu.be' in url):
+            return jsonify({'success': False, 'error': 'URL no válida. Solo YouTube o TikTok'}), 400
         
         if download_type not in ['video', 'audio', 'best']:
             download_type = 'best'
@@ -535,7 +372,7 @@ def download():
         logger.info(f"Solicitud de descarga: {url} - Tipo: {download_type}")
         
         # Crear descargador
-        downloader = FixedDownloader()
+        downloader = ModernDownloader()
         
         # Ejecutar descarga
         result = downloader.download(url, download_type)
@@ -552,9 +389,6 @@ def download():
             return jsonify({'success': False, 'error': 'Archivo no encontrado'}), 404
         
         file_size = os.path.getsize(filepath)
-        if file_size == 0:
-            downloader.cleanup()
-            return jsonify({'success': False, 'error': 'Archivo vacío'}), 400
         
         # Stream del archivo
         def generate():
@@ -585,7 +419,6 @@ def download():
                 'X-Download-Time': str(result['download_time']),
                 'X-File-Size': str(file_size),
                 'X-File-Type': download_type,
-                'X-Platform': result.get('platform', 'unknown')
             }
         )
         
@@ -603,138 +436,37 @@ def quick_download():
         if not url:
             return jsonify({'success': False, 'error': 'Se requiere parámetro ?url='}), 400
         
-        # Información del video primero
-        downloader = FixedDownloader()
-        info = downloader.get_info(url)
-        downloader.cleanup()
-        
-        if not info.get('success'):
-            return jsonify(info), 400
-        
         return jsonify({
             'success': True,
-            'info': info,
-            'download_url': f'/download',
+            'url': url,
+            'type': download_type,
+            'info_endpoint': '/info',
+            'download_endpoint': '/download',
             'method': 'POST',
-            'post_data': {
-                'url': url,
-                'type': download_type
-            }
+            'post_data': {'url': url, 'type': download_type}
         })
         
     except Exception as e:
         logger.error(f"Error en /quick: {e}")
         return jsonify({'success': False, 'error': 'Error del servidor'}), 500
 
-@app.route('/test/tiktok', methods=['GET'])
-def test_tiktok():
-    """Endpoint de prueba para TikTok"""
-    test_url = "https://vm.tiktok.com/ZMD1m322D/"
+@app.route('/test', methods=['GET'])
+def test():
+    """Endpoint de prueba del servidor"""
+    test_urls = {
+        'youtube': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        'tiktok': 'https://www.tiktok.com/@example/video/1234567890'
+    }
     
-    try:
-        downloader = FixedDownloader()
-        
-        # Probar información
-        info = downloader.get_info(test_url)
-        
-        if not info.get('success'):
-            downloader.cleanup()
-            return jsonify({
-                'test': 'tiktok_info_failed',
-                'error': info.get('error')
-            })
-        
-        # Probar descarga de video
-        video_result = downloader.download(test_url, 'video')
-        
-        if video_result.get('success'):
-            video_file = video_result.get('filename')
-            video_size = video_result.get('filesize_mb', 0)
-            downloader.cleanup()
-            
-            return jsonify({
-                'test': 'tiktok_success',
-                'info': info,
-                'video': {
-                    'success': video_result.get('success'),
-                    'filename': video_file,
-                    'size_mb': video_size
-                }
-            })
-        else:
-            downloader.cleanup()
-            return jsonify({
-                'test': 'tiktok_download_failed',
-                'info': info,
-                'video_error': video_result.get('error')
-            })
-            
-    except Exception as e:
-        return jsonify({
-            'test': 'tiktok_error',
-            'error': str(e)
-        })
-
-@app.route('/test/youtube', methods=['GET'])
-def test_youtube():
-    """Endpoint de prueba para YouTube"""
-    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    
-    try:
-        downloader = FixedDownloader()
-        
-        # Probar información
-        info = downloader.get_info(test_url)
-        
-        if not info.get('success'):
-            downloader.cleanup()
-            return jsonify({
-                'test': 'youtube_info_failed',
-                'error': info.get('error')
-            })
-        
-        # Probar descarga de audio
-        audio_result = downloader.download(test_url, 'audio')
-        
-        if audio_result.get('success'):
-            audio_file = audio_result.get('filename')
-            audio_size = audio_result.get('filesize_mb', 0)
-            downloader.cleanup()
-            
-            # Crear nuevo descargador para video
-            downloader2 = FixedDownloader()
-            video_result = downloader2.download(test_url, 'video')
-            video_file = video_result.get('filename') if video_result.get('success') else None
-            video_size = video_result.get('filesize_mb', 0) if video_result.get('success') else 0
-            downloader2.cleanup()
-            
-            return jsonify({
-                'test': 'youtube_success',
-                'info': info,
-                'audio': {
-                    'success': audio_result.get('success'),
-                    'filename': audio_file,
-                    'size_mb': audio_size
-                },
-                'video': {
-                    'success': video_result.get('success'),
-                    'filename': video_file,
-                    'size_mb': video_size
-                }
-            })
-        else:
-            downloader.cleanup()
-            return jsonify({
-                'test': 'youtube_download_failed',
-                'info': info,
-                'audio_error': audio_result.get('error')
-            })
-            
-    except Exception as e:
-        return jsonify({
-            'test': 'youtube_error',
-            'error': str(e)
-        })
+    return jsonify({
+        'server': 'running',
+        'ytdlp_version': yt_dlp.version.__version__,
+        'test_urls': test_urls,
+        'endpoints': {
+            'test_youtube_info': f'/info?url={test_urls["youtube"]}',
+            'test_tiktok_info': f'/info?url={test_urls["tiktok"]}'
+        }
+    })
 
 # ==============================
 # MANEJO DE ERRORES
@@ -750,31 +482,40 @@ def method_not_allowed(error):
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Error 500: {error}")
-    return jsonify({'success': False, 'error': 'Error interno'}), 500
+    return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
 # ==============================
 # INICIALIZACIÓN
 # ==============================
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 8.0")
+    print("🚀 SERVIDOR YOUTUBE/TIKTOK")
     print("="*60)
-    print("✅ Corregido para TikTok (error sigi)")
-    print("✅ Corregido para YouTube (error login)")
-    print("✅ yt-dlp actualizado automáticamente")
-    print("✅ Configuración robusta y optimizada")
+    print(f"✅ yt-dlp versión: {yt_dlp.version.__version__}")
+    print(f"✅ Python versión: {sys.version.split()[0]}")
+    print("✅ Configuración optimizada para Render.com")
     print("="*60)
     print(f"📡 Servidor: http://{Config.HOST}:{Config.PORT}")
     print("="*60)
-    print("📊 Endpoints de prueba:")
-    print("  /test/tiktok - Probar descarga de TikTok")
-    print("  /test/youtube - Probar descarga de YouTube")
+    print("📊 Endpoints disponibles:")
+    print("  /             - Información del servicio")
+    print("  /health       - Health check")
+    print("  /info         - Obtener info de video (POST/GET)")
+    print("  /download     - Descargar video/audio (POST)")
+    print("  /quick        - Descarga rápida (GET)")
+    print("  /test         - Probar servidor")
     print("="*60 + "\n")
     
-    app.run(
-        host=Config.HOST,
-        port=Config.PORT,
-        debug=False,
-        threaded=True,
-        use_reloader=False
-    )
+    # Para producción en Render.com, usa waitress
+    if os.environ.get('RENDER', '').lower() == 'true':
+        from waitress import serve
+        serve(app, host=Config.HOST, port=Config.PORT)
+    else:
+        # Para desarrollo local
+        app.run(
+            host=Config.HOST,
+            port=Config.PORT,
+            debug=False,
+            threaded=True,
+            use_reloader=False
+        )
