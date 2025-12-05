@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🚀 SERVIDOR YOUTUBE/TIKTOK PARA RENDER.COM - VERSIÓN 5.0
-Versión: 5.0 - Corregido problema de archivos corruptos, mejora en calidad y formato
+🚀 SERVIDOR YOUTUBE/TIKTOK PARA RENDER.COM - VERSIÓN 5.1
+Versión: 5.1 - Corregido problema de descarga MHTML y mejorado formato
 """
 
 import os
@@ -121,6 +121,10 @@ class FileUtils:
                     if not (header[4:8] == b'ftyp' or header[4:8] == b'moov'):
                         logger.warning(f"MP4 sin cabecera válida: {filepath}")
                         return False
+            else:
+                # No es un formato multimedia esperado
+                logger.warning(f"Formato no soportado: {filepath}")
+                return False
             
             return True
             
@@ -129,9 +133,9 @@ class FileUtils:
             return False
 
 # ==============================
-# CLASE DE DESCARGA MEJORADA
+# CLASE DE DESCARGA CORREGIDA - EVITA MHTML
 # ==============================
-class RobustDownloader:
+class FixedDownloader:
     def __init__(self, url: str, download_type: str = "best"):
         self.url = url
         self.download_type = download_type
@@ -201,16 +205,17 @@ class RobustDownloader:
             return {'success': False, 'error': f'Error procesando video: {str(e)}'}
 
     def download(self) -> Dict[str, Any]:
-        """Ejecuta la descarga del video/audio con configuración mejorada"""
+        """Ejecuta la descarga del video/audio CON CONFIGURACIÓN CORREGIDA"""
         self.status = "downloading"
         
         try:
-            # Configuración MEJORADA para yt-dlp
+            # CONFIGURACIÓN CORREGIDA - EVITA MHTML
+            # Base configuration
             ydl_opts = {
                 'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
                 'quiet': True,
                 'no_warnings': True,
-                'ignoreerrors': False,  # Cambiado a False para detectar errores
+                'ignoreerrors': False,
                 'no_check_certificate': True,
                 'socket_timeout': 30,
                 'retries': 5,
@@ -218,18 +223,24 @@ class RobustDownloader:
                 'concurrent_fragment_downloads': 2,
                 'http_headers': {'User-Agent': random.choice(Config.USER_AGENTS)},
                 'progress_hooks': [self._progress_hook],
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android', 'web'],
-                        'player_skip': ['js', 'configs', 'webpage']
-                    }
+                # IMPORTANTE: Evitar formatos no deseados
+                'format': None,  # Se establecerá según tipo
+                'postprocessor_args': {
+                    'ffmpeg': ['-hide_banner', '-loglevel', 'error']
                 },
+                'prefer_ffmpeg': True,
+                'keepvideo': False,
+                'noplaylist': True,
+                'nooverwrites': True,
             }
 
-            # Configuración específica para audio
+            # Configuración ESPECÍFICA para evitar MHTML
             if self.download_type == "audio":
+                # Forzar audio MP3 con formato específico
                 ydl_opts.update({
                     'format': 'bestaudio/best',
+                    'extractaudio': True,
+                    'audioformat': 'mp3',
                     'postprocessors': [
                         {
                             'key': 'FFmpegExtractAudio',
@@ -238,19 +249,52 @@ class RobustDownloader:
                         },
                         {
                             'key': 'FFmpegMetadata',
+                            'add_metadata': True,
                         }
                     ],
                     'writethumbnail': True,
                     'postprocessor_args': {
-                        'ffmpeg': ['-metadata', 'title=%(title)s', '-metadata', 'artist=%(uploader)s']
+                        'ffmpeg': [
+                            '-i', '%(filepath)s',
+                            '-acodec', 'libmp3lame',
+                            '-q:a', '2',
+                            '-metadata', 'title=%(title)s',
+                            '-metadata', 'artist=%(uploader)s',
+                            '-y', '%(filepath)s.%(ext)s'
+                        ]
                     },
-                    'keepvideo': False,
                 })
                 
-            # Configuración específica para video
             elif self.download_type == "video":
+                # Forzar video MP4 con formato específico
                 ydl_opts.update({
-                    'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+                    'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
+                    'merge_output_format': 'mp4',
+                    'postprocessors': [
+                        {
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',
+                        },
+                        {
+                            'key': 'FFmpegMetadata',
+                        }
+                    ],
+                    'postprocessor_args': {
+                        'ffmpeg': [
+                            '-i', '%(filepath)s',
+                            '-c:v', 'copy',
+                            '-c:a', 'aac',
+                            '-b:a', '192k',
+                            '-movflags', '+faststart',
+                            '-y', '%(filepath)s.%(ext)s'
+                        ]
+                    },
+                })
+                
+            else:  # "best"
+                # Formato balanceado pero evitando MHTML
+                ydl_opts.update({
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                     'merge_output_format': 'mp4',
                     'postprocessors': [
                         {
@@ -259,67 +303,88 @@ class RobustDownloader:
                         }
                     ],
                 })
-                
-            # Configuración para "best" (balanceado)
-            else:
-                ydl_opts.update({
-                    'format': 'best[height<=1080]/best',
-                    'merge_output_format': 'mp4',
-                })
 
             logger.info(f"Configuración de descarga: {self.download_type}")
 
             # Ejecutar descarga
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.url, download=True)
+                try:
+                    info = ydl.extract_info(self.url, download=True)
+                except Exception as e:
+                    logger.error(f"Error en yt-dlp: {e}")
+                    self.status = "failed"
+                    return {'success': False, 'error': f'Error descargando: {str(e)}'}
 
                 if not info:
                     self.status = "failed"
                     return {'success': False, 'error': 'No se pudo extraer información del video'}
 
-                # Buscar archivo descargado de forma más precisa
+                # Buscar archivo descargado - EVITAR MHTML EXPLÍCITAMENTE
                 downloaded_files = []
                 expected_exts = []
                 
+                # Definir extensiones esperadas por tipo
                 if self.download_type == "audio":
-                    expected_exts = ['.mp3', '.m4a', '.opus', '.ogg', '.wav']
-                elif self.download_type == "video":
-                    expected_exts = ['.mp4', '.mkv', '.webm', '.avi', '.mov']
+                    expected_exts = ['.mp3', '.m4a', '.ogg', '.wav']
                 else:
-                    expected_exts = ['.mp4', '.mkv', '.webm', '.mp3', '.m4a']
+                    expected_exts = ['.mp4', '.mkv', '.webm', '.avi', '.mov']
 
+                logger.info(f"Buscando archivos con extensiones: {expected_exts}")
+                
                 for root, dirs, files in os.walk(self.temp_dir):
                     for file in files:
                         filepath = os.path.join(root, file)
+                        file_ext = os.path.splitext(file)[1].lower()
                         
+                        # IGNORAR EXPLÍCITAMENTE ARCHIVOS MHTML
+                        if file_ext == '.mhtml':
+                            logger.warning(f"Archivo MHTML ignorado: {filepath}")
+                            continue
+                            
                         # Ignorar archivos temporales y parciales
-                        if any(file.endswith(ext) for ext in ['.part', '.ytdl', '.temp', '.tmp']):
+                        if any(file.endswith(ext) for ext in ['.part', '.ytdl', '.temp', '.tmp', '.frag', '.ytdlp']):
                             continue
                             
                         # Verificar extensión esperada
-                        file_ext = os.path.splitext(file)[1].lower()
                         if expected_exts and file_ext not in expected_exts:
+                            logger.warning(f"Extensión no esperada ignorada: {file_ext} - {filepath}")
                             continue
                             
                         # Verificar que tenga un tamaño mínimo
                         try:
-                            if os.path.getsize(filepath) > 1024:  # Al menos 1KB
-                                downloaded_files.append(filepath)
+                            file_size = os.path.getsize(filepath)
+                            if file_size > 1024:  # Al menos 1KB
+                                downloaded_files.append({
+                                    'path': filepath,
+                                    'size': file_size,
+                                    'ext': file_ext
+                                })
+                                logger.info(f"Archivo encontrado: {file} - {file_size} bytes")
                         except:
                             continue
 
                 if not downloaded_files:
                     self.status = "failed"
-                    # Listar archivos en el directorio para debug
+                    # Listar TODOS los archivos para debug
                     all_files = []
                     for root, dirs, files in os.walk(self.temp_dir):
                         for file in files:
-                            all_files.append(file)
+                            all_files.append(f"{file} ({os.path.getsize(os.path.join(root, file))} bytes)")
                     logger.error(f"No se encontraron archivos válidos. Archivos en temp: {all_files}")
-                    return {'success': False, 'error': 'No se generó ningún archivo válido'}
+                    return {'success': False, 'error': 'No se generó ningún archivo de audio/video válido'}
 
-                # Seleccionar el archivo más grande (probablemente el correcto)
-                self.output_path = max(downloaded_files, key=lambda x: os.path.getsize(x))
+                # Seleccionar el archivo más grande con extensión preferida
+                preferred_ext = '.mp3' if self.download_type == 'audio' else '.mp4'
+                
+                # Primero intentar con la extensión preferida
+                preferred_files = [f for f in downloaded_files if f['ext'] == preferred_ext]
+                if preferred_files:
+                    self.output_path = max(preferred_files, key=lambda x: x['size'])['path']
+                else:
+                    # Si no hay con la extensión preferida, usar el más grande
+                    self.output_path = max(downloaded_files, key=lambda x: x['size'])['path']
+                
+                logger.info(f"Archivo seleccionado: {os.path.basename(self.output_path)} - {os.path.getsize(self.output_path)} bytes")
                 
                 # Verificar integridad del archivo
                 if not FileUtils.is_valid_media_file(self.output_path):
@@ -328,10 +393,10 @@ class RobustDownloader:
                     
                     # Intentar con otro archivo si hay más
                     if len(downloaded_files) > 1:
-                        for filepath in downloaded_files:
-                            if filepath != self.output_path and FileUtils.is_valid_media_file(filepath):
-                                self.output_path = filepath
-                                logger.info(f"Usando archivo alternativo: {self.output_path}")
+                        for file_info in downloaded_files:
+                            if file_info['path'] != self.output_path and FileUtils.is_valid_media_file(file_info['path']):
+                                self.output_path = file_info['path']
+                                logger.info(f"Usando archivo alternativo válido: {self.output_path}")
                                 break
                         else:
                             return {'success': False, 'error': 'Ningún archivo generado es válido'}
@@ -382,6 +447,8 @@ class RobustDownloader:
                 return {'success': False, 'error': 'Video privado'}
             elif "Video unavailable" in error_msg:
                 return {'success': False, 'error': 'Video no disponible'}
+            elif "format not available" in error_msg.lower():
+                return {'success': False, 'error': 'Formato no disponible para este video'}
             else:
                 return {'success': False, 'error': f'Error de descarga: {error_msg[:100]}'}
                 
@@ -397,6 +464,7 @@ class RobustDownloader:
                 self.progress = (d['downloaded_bytes'] / d['total_bytes']) * 100
             elif 'total_bytes_estimate' in d:
                 self.progress = (d['downloaded_bytes'] / d['total_bytes_estimate']) * 100
+            logger.debug(f"Progreso: {self.progress:.1f}%")
 
 # ==============================
 # GESTOR DE TAREAS
@@ -433,7 +501,7 @@ class TaskManager:
             try:
                 with self.lock:
                     self.tasks[task_id]['status'] = 'downloading'
-                    downloader = RobustDownloader(url, download_type)
+                    downloader = FixedDownloader(url, download_type)
                     self.tasks[task_id]['downloader'] = downloader
                 
                 result = downloader.download()
@@ -454,7 +522,7 @@ class TaskManager:
                     self.tasks[task_id]['error'] = str(e)
         
         self.executor.submit(run_task)
-        logger.info(f"Nueva tarea creada: {task_id}")
+        logger.info(f"Nueva tarea creada: {task_id} - {url[:50]}...")
         return task_id
 
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -534,7 +602,7 @@ cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
 cleanup_thread.start()
 
 # ==============================
-# ENDPOINTS DE LA API
+# ENDPOINTS DE LA API - SIMPLIFICADOS
 # ==============================
 
 @app.route('/')
@@ -542,17 +610,18 @@ def home():
     """Página principal"""
     return jsonify({
         'service': 'YouTube/TikTok Downloader API',
-        'version': '5.0',
+        'version': '5.1',
         'status': 'online',
         'timestamp': datetime.now().isoformat(),
         'endpoints': {
             '/': 'Documentación',
             '/health': 'Health check',
-            '/info': 'Obtener información de video',
-            '/download/start': 'Iniciar descarga asíncrona (POST)',
-            '/download/status/<id>': 'Consultar estado (GET)',
-            '/download/get/<id>': 'Descargar archivo (GET)',
-            '/download/direct': 'Descarga directa sincrónica (POST)',
+            '/info': 'Obtener información de video (POST)',
+            '/download/direct': 'Descarga directa (POST)',
+        },
+        'usage': {
+            'info': 'POST /info {"url": "youtube_url"}',
+            'download': 'POST /download/direct {"url": "youtube_url", "type": "video|audio|best"}'
         }
     })
 
@@ -562,115 +631,74 @@ def health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'service': 'youtube-downloader-v5',
+        'service': 'youtube-downloader-v5.1',
         'python_version': sys.version.split()[0]
     })
 
-@app.route('/info', methods=['POST', 'GET'])
+@app.route('/info', methods=['POST'])
 def get_video_info():
     """Obtiene información de un video"""
     try:
-        if request.method == 'POST':
-            data = request.get_json(silent=True) or request.form
-        else:
-            data = request.args
-
-        url = data.get('url')
-        if not url:
-            return jsonify({'success': False, 'error': 'Se requiere parámetro "url"'}), 400
-
-        # Validar URL
-        if not any(domain in url.lower() for domain in ['youtube.com', 'youtu.be', 'tiktok.com', 'vm.tiktok.com']):
-            return jsonify({'success': False, 'error': 'URL no válida'}), 400
-
-        downloader = RobustDownloader(url)
-        result = downloader.get_info()
-
-        if result['success']:
-            return jsonify(result)
-        else:
-            return jsonify(result), 400
-
-    except Exception as e:
-        logger.error(f"Error en /info: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
-
-@app.route('/download/start', methods=['POST'])
-def start_download():
-    """Inicia una descarga asíncrona"""
-    try:
         data = request.get_json(silent=True) or request.form
-
+        
         if not data:
             return jsonify({'success': False, 'error': 'No se recibieron datos'}), 400
-
+        
         url = data.get('url')
-        download_type = data.get('type', 'best')
-
         if not url:
             return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
+        
+        # Validar URL
+        if not any(domain in url.lower() for domain in ['youtube.com', 'youtu.be', 'tiktok.com']):
+            return jsonify({'success': False, 'error': 'URL no válida. Solo YouTube y TikTok'}), 400
+        
+        downloader = FixedDownloader(url)
+        result = downloader.get_info()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error en /info: {e}")
+        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
+@app.route('/download/direct', methods=['POST'])
+def direct_download():
+    """Descarga directa (sincrónica) - Endpoint principal"""
+    try:
+        data = request.get_json(silent=True) or request.form
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'No se recibieron datos'}), 400
+        
+        url = data.get('url')
+        download_type = data.get('type', 'best')
+        
+        if not url:
+            return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
+        
         if download_type not in ['video', 'audio', 'best']:
             return jsonify({'success': False, 'error': 'Tipo debe ser: video, audio o best'}), 400
-
-        task_id = task_manager.create_task(url, download_type)
-
-        return jsonify({
-            'success': True,
-            'task_id': task_id,
-            'message': 'Descarga iniciada',
-            'status_url': f'/download/status/{task_id}',
-            'download_url': f'/download/get/{task_id}'
-        })
-
-    except Exception as e:
-        logger.error(f"Error en /download/start: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
-
-@app.route('/download/status/<task_id>', methods=['GET'])
-def download_status(task_id):
-    """Consulta el estado de una descarga"""
-    try:
-        status = task_manager.get_task_status(task_id)
-
-        if not status:
-            return jsonify({'success': False, 'error': 'Tarea no encontrada'}), 404
-
-        return jsonify({
-            'success': True,
-            'task_id': task_id,
-            'status': status['status'],
-            'progress': status['progress'],
-            'error': status.get('error'),
-            'elapsed_time': status['elapsed_time']
-        })
-
-    except Exception as e:
-        logger.error(f"Error en /download/status: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
-
-@app.route('/download/get/<task_id>', methods=['GET'])
-def download_file(task_id):
-    """Descarga el archivo completado"""
-    try:
-        result = task_manager.get_task_result(task_id)
-
-        if not result:
-            return jsonify({'success': False, 'error': 'Archivo no disponible'}), 404
-
+        
+        logger.info(f"Descarga directa solicitada: {url} - Tipo: {download_type}")
+        
+        # Ejecutar descarga
+        downloader = FixedDownloader(url, download_type)
+        result = downloader.download()
+        
         if not result['success']:
             return jsonify(result), 400
-
+        
         filepath = result['filepath']
         filename = result['filename']
-
+        
         if not os.path.exists(filepath):
             return jsonify({'success': False, 'error': 'Archivo no encontrado'}), 404
-
+        
         # Verificar integridad final
         if not FileUtils.is_valid_media_file(filepath):
-            return jsonify({'success': False, 'error': 'Archivo corrupto'}), 500
-
+            downloader.cleanup()
+            return jsonify({'success': False, 'error': 'Archivo corrupto generado'}), 500
+        
         # Stream del archivo
         def generate():
             try:
@@ -686,7 +714,7 @@ def download_file(task_id):
                         shutil.rmtree(temp_dir, ignore_errors=True)
                 except Exception as e:
                     logger.error(f"Error limpiando archivos: {e}")
-
+        
         # Determinar tipo MIME correcto
         filename_lower = filename.lower()
         if filename_lower.endswith('.mp3'):
@@ -699,82 +727,7 @@ def download_file(task_id):
             mimetype = 'audio/mp4'
         else:
             mimetype = 'application/octet-stream'
-
-        return Response(
-            generate(),
-            mimetype=mimetype,
-            headers={
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Content-Length': str(result['filesize']),
-                'Content-Type': mimetype,
-                'Accept-Ranges': 'bytes',
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Error en /download/get: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
-
-@app.route('/download/direct', methods=['POST'])
-def direct_download():
-    """Descarga directa (sincrónica) - Para uso simple"""
-    try:
-        data = request.get_json(silent=True) or request.form
-
-        if not data:
-            return jsonify({'success': False, 'error': 'No se recibieron datos'}), 400
-
-        url = data.get('url')
-        download_type = data.get('type', 'best')
-
-        if not url:
-            return jsonify({'success': False, 'error': 'Se requiere URL'}), 400
-
-        logger.info(f"Descarga directa iniciada: {url} - Tipo: {download_type}")
-
-        # Ejecutar descarga
-        downloader = RobustDownloader(url, download_type)
-        result = downloader.download()
-
-        if not result['success']:
-            return jsonify(result), 400
-
-        filepath = result['filepath']
-        filename = result['filename']
-
-        if not os.path.exists(filepath):
-            return jsonify({'success': False, 'error': 'Archivo no encontrado'}), 404
-
-        # Verificar integridad final
-        if not FileUtils.is_valid_media_file(filepath):
-            downloader.cleanup()
-            return jsonify({'success': False, 'error': 'Archivo corrupto generado'}), 500
-
-        # Stream del archivo
-        def generate():
-            try:
-                with open(filepath, 'rb') as f:
-                    while chunk := f.read(8192):
-                        yield chunk
-            finally:
-                # Limpiar después de enviar
-                try:
-                    os.remove(filepath)
-                    temp_dir = result.get('temp_dir')
-                    if temp_dir and os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                except Exception as e:
-                    logger.error(f"Error limpiando archivos directos: {e}")
-
-        # Determinar tipo MIME
-        filename_lower = filename.lower()
-        if filename_lower.endswith('.mp3'):
-            mimetype = 'audio/mpeg'
-        elif filename_lower.endswith('.mp4'):
-            mimetype = 'video/mp4'
-        else:
-            mimetype = 'application/octet-stream'
-
+        
         return Response(
             generate(),
             mimetype=mimetype,
@@ -784,18 +737,17 @@ def direct_download():
                 'Content-Type': mimetype,
             }
         )
-
+        
     except Exception as e:
         logger.error(f"Error en /download/direct: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': f'Error: {str(e)}'}), 500
+        return jsonify({'success': False, 'error': f'Error del servidor: {str(e)}'}), 500
 
 @app.route('/test', methods=['GET'])
 def test_endpoint():
-    """Endpoint de prueba"""
+    """Endpoint de prueba simple"""
     return jsonify({
         'success': True,
-        'message': 'Servidor funcionando correctamente',
-        'version': '5.0',
+        'message': 'Servidor funcionando - Versión 5.1',
         'timestamp': datetime.now().isoformat(),
     })
 
@@ -820,23 +772,22 @@ def internal_error(error):
 # ==============================
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 5.0")
+    print("🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 5.1")
     print("="*70)
     print(f"📡 Host: {Config.HOST}")
     print(f"🔌 Puerto: {Config.PORT}")
-    print(f"👥 Workers: {Config.MAX_WORKERS}")
     print("="*70)
-    print("✅ Sistema mejorado para archivos válidos")
-    print("✅ Verificación de integridad de archivos")
-    print("✅ Configuración optimizada para calidad")
-    print("✅ Compatible con YouTube y TikTok")
+    print("✅ Sistema corregido - Evita archivos MHTML")
+    print("✅ Forzado a formatos MP3/MP4 válidos")
+    print("✅ Verificación de integridad mejorada")
+    print("✅ Endpoints simplificados y estables")
     print("="*70)
     print(f"📅 Iniciado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*70 + "\n")
-
+    
     # Crear directorio temporal
     os.makedirs('/tmp/youtube_downloads', exist_ok=True)
-
+    
     # Iniciar servidor
     app.run(
         host=Config.HOST,
