@@ -1,7 +1,4 @@
 Flask==2.3.3
 Flask-CORS==4.0.0
-Flask-Limiter==3.3.1
 yt-dlp==2023.10.13
-Werkzeug==2.3.7
-cachetools==5.3.1
 waitress==2.1.2
