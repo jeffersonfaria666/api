@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🚀 SERVIDOR YOUTUBE PARA RENDER.COM - VERSIÓN CORREGIDA
-Versión: 3.0 - Optimizado para Render con cookies
+🚀 SERVIDOR YOUTUBE DEFINITIVO PARA RENDER.COM
+Versión: 5.0 - Totalmente corregido y optimizado
 """
 
 import os
@@ -11,7 +11,6 @@ import logging
 import tempfile
 import shutil
 import time
-import mimetypes
 from datetime import datetime
 from typing import Dict, Any, Optional
 
@@ -26,7 +25,10 @@ class Config:
     PORT = int(os.environ.get('PORT', 10000))
     HOST = '0.0.0.0'
     MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
-    COOKIES_FILE = 'cookies.txt'  # Archivo de cookies en el repositorio
+    COOKIES_FILE = 'cookies.txt'
+    
+    # Video de prueba que SIEMPRE funciona
+    TEST_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 # ==============================
 # SETUP DE LOGGING
@@ -44,32 +46,26 @@ def setup_logging():
 logger = setup_logging()
 
 # ==============================
-# MANEJO DE COOKIES
+# MANEJO DE COOKIES SIMPLIFICADO
 # ==============================
-def load_cookies_config():
-    """Carga configuración de cookies de manera segura"""
-    cookies_config = {}
+def get_cookies_config():
+    """Obtiene configuración de cookies de manera simple"""
     
-    # Verificar si existe el archivo de cookies
+    # Verificar si existe el archivo
     if os.path.exists(Config.COOKIES_FILE):
         try:
-            # Validar que el archivo no esté vacío y tenga formato correcto
             with open(Config.COOKIES_FILE, 'r', encoding='utf-8') as f:
-                content = f.read()
+                content = f.read(1000)  # Leer solo un poco
                 
-            if content.strip() and '# Netscape HTTP Cookie File' in content:
-                cookies_config['cookiefile'] = Config.COOKIES_FILE
-                logger.info(f"✅ Cookies cargadas desde: {Config.COOKIES_FILE}")
-                logger.info(f"   Tamaño: {len(content)} bytes")
-            else:
-                logger.warning(f"⚠️  Archivo de cookies vacío o formato incorrecto")
-                
+            # Verificar que sea un archivo válido
+            if content and len(content) > 100 and ('# Netscape' in content or '.youtube.com' in content):
+                logger.info(f"✅ Archivo de cookies encontrado: {Config.COOKIES_FILE}")
+                return {'cookiefile': Config.COOKIES_FILE}
         except Exception as e:
-            logger.error(f"❌ Error leyendo cookies: {e}")
-    else:
-        logger.info("ℹ️  No se encontró archivo de cookies. Modo guest.")
+            logger.warning(f"⚠️  Error leyendo cookies: {e}")
     
-    return cookies_config
+    logger.info("ℹ️  Modo sin cookies (guest)")
+    return {}
 
 # ==============================
 # CLASE DESCARGADOR OPTIMIZADA
@@ -78,63 +74,22 @@ class YouTubeDownloader:
     def __init__(self):
         self.temp_dir = None
         self.output_path = None
-        self.cookies_config = load_cookies_config()
-        self.cookies_working = False
-        
-        # Probar cookies con un método seguro
-        self._test_cookies_safely()
-    
-    def _test_cookies_safely(self):
-        """Prueba cookies de manera segura sin causar errores"""
-        if not self.cookies_config:
-            self.cookies_working = False
-            return
-        
-        try:
-            # URL de prueba simple
-            test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-            
-            ydl_opts = {
-                'cookiefile': self.cookies_config.get('cookiefile'),
-                'quiet': True,
-                'skip_download': True,
-                'no_warnings': True,
-                'ignoreerrors': True,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(test_url, download=False)
-                
-                if info and info.get('title'):
-                    self.cookies_working = True
-                    logger.info(f"✅ Cookies funcionan correctamente")
-                else:
-                    self.cookies_working = False
-                    logger.warning(f"⚠️  Cookies podrían no funcionar")
-                    
-        except Exception as e:
-            self.cookies_working = False
-            logger.warning(f"⚠️  Error probando cookies: {str(e)[:100]}")
+        self.cookies_config = get_cookies_config()
     
     def sanitize_filename(self, filename):
-        """Limpia nombre de archivo para ser seguro"""
-        # Remover caracteres peligrosos
+        """Limpia el nombre del archivo"""
+        # Remover caracteres problemáticos
         invalid_chars = '<>:"/\\|?*'
         for char in invalid_chars:
             filename = filename.replace(char, '_')
-        
-        # Limitar longitud
-        filename = filename[:150]
-        
-        return filename.strip()
+        return filename[:100]
     
     def _get_base_options(self):
-        """Opciones base optimizadas para Render"""
+        """Opciones base optimizadas"""
         base_opts = {
             'quiet': True,
             'no_warnings': True,
             'no_color': True,
-            'noprogress': True,
             'ignoreerrors': True,
             'no_check_certificate': True,
             'socket_timeout': 30,
@@ -142,8 +97,9 @@ class YouTubeDownloader:
             'fragment_retries': 3,
             'concurrent_fragment_downloads': 2,
             'noplaylist': True,
+            'noprogress': True,
             
-            # Headers genéricos para evitar bloqueos
+            # Headers para evitar bloqueos
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': '*/*',
@@ -151,22 +107,23 @@ class YouTubeDownloader:
                 'Referer': 'https://www.youtube.com/',
             },
             
-            # Evitar descargas grandes innecesarias
-            'max_filesize': Config.MAX_FILE_SIZE,
-            
-            # Throttle para ser buen ciudadano
-            'throttledratelimit': 1000000,  # 1 MB/s
+            # Configuración para YouTube
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                    'player_skip': ['configs', 'js'],
+                }
+            },
         }
         
         # Añadir cookies si están disponibles
-        if self.cookies_config and self.cookies_working:
+        if self.cookies_config:
             base_opts.update(self.cookies_config)
-            logger.debug("Usando cookies para la descarga")
         
         return base_opts
     
     def get_info(self, url: str) -> Dict[str, Any]:
-        """Obtiene información del video de manera segura"""
+        """Obtiene información del video - ACEPTA CUALQUIER VIDEO DISPONIBLE"""
         try:
             ydl_opts = self._get_base_options()
             ydl_opts['skip_download'] = True
@@ -175,19 +132,17 @@ class YouTubeDownloader:
                 info = ydl.extract_info(url, download=False)
                 
                 if not info:
-                    return {'success': False, 'error': 'No se pudo obtener información del video'}
+                    return {
+                        'success': False, 
+                        'error': 'No se pudo obtener información del video'
+                    }
                 
                 # Formatear duración
                 duration = info.get('duration', 0)
                 if duration > 0:
-                    hours = duration // 3600
-                    minutes = (duration % 3600) // 60
+                    minutes = duration // 60
                     seconds = duration % 60
-                    
-                    if hours > 0:
-                        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                    else:
-                        duration_str = f"{minutes:02d}:{seconds:02d}"
+                    duration_str = f"{minutes}:{seconds:02d}"
                 else:
                     duration_str = "Desconocida"
                 
@@ -195,85 +150,70 @@ class YouTubeDownloader:
                     'success': True,
                     'title': info.get('title', 'Video sin título'),
                     'duration': duration_str,
-                    'duration_seconds': duration,
                     'uploader': info.get('uploader', 'Desconocido'),
                     'view_count': info.get('view_count', 0),
                     'thumbnail': info.get('thumbnail', ''),
-                    'has_cookies': self.cookies_working,
-                    'available': True
+                    'available': True,
+                    'has_cookies': bool(self.cookies_config)
                 }
                 
-        except yt_dlp.utils.DownloadError as e:
-            error_msg = str(e)
-            if "Private" in error_msg or "Sign in" in error_msg:
-                return {'success': False, 'error': 'Video privado o requiere inicio de sesión'}
-            else:
-                return {'success': False, 'error': error_msg[:150]}
         except Exception as e:
-            logger.error(f"Error en get_info: {e}")
-            return {'success': False, 'error': 'Error al obtener información'}
+            error_msg = str(e)
+            logger.error(f"Error en get_info: {error_msg}")
+            
+            # Mensajes de error más amigables
+            if "Private" in error_msg or "Sign in" in error_msg:
+                return {
+                    'success': False, 
+                    'error': 'Este video es privado o requiere inicio de sesión',
+                    'has_cookies': bool(self.cookies_config)
+                }
+            elif "not available" in error_msg or "unavailable" in error_msg:
+                return {'success': False, 'error': 'Video no disponible en tu región'}
+            else:
+                return {'success': False, 'error': 'Error al obtener información del video'}
     
-    def _download_media(self, url: str, media_type: str, quality: Optional[str] = None) -> Dict[str, Any]:
-        """Método genérico para descargar audio o video"""
-        self.temp_dir = tempfile.mkdtemp(prefix=f"yt_{media_type}_")
+    def download_audio(self, url: str) -> Dict[str, Any]:
+        """Descarga audio - USA EL FORMATO DISPONIBLE"""
+        self.temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
         start_time = time.time()
         
         try:
             ydl_opts = self._get_base_options()
-            
-            if media_type == 'audio':
-                # Formato para audio - usar el mejor audio disponible
-                ydl_opts['format'] = 'bestaudio/best'
-                ydl_opts['postprocessors'] = [{
+            ydl_opts.update({
+                'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
+                # Formato FLEXIBLE: cualquier audio disponible
+                'format': 'bestaudio/best',
+                'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': quality if quality in ['128', '192', '256', '320'] else '192',
-                }]
-                ydl_opts['keepvideo'] = False
-                file_ext = 'mp3'
-                mimetype = 'audio/mpeg'
-            else:
-                # Formato para video - buscar el mejor disponible
-                if quality == 'best':
-                    ydl_opts['format'] = 'best[ext=mp4]/best'
-                elif quality == '720':
-                    ydl_opts['format'] = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-                elif quality == '480':
-                    ydl_opts['format'] = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-                elif quality == '360':
-                    ydl_opts['format'] = 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-                else:
-                    # Por defecto, buscar cualquier formato de video
-                    ydl_opts['format'] = 'best[ext=mp4]/best'
-                
-                ydl_opts['merge_output_format'] = 'mp4'
-                file_ext = 'mp4'
-                mimetype = 'video/mp4'
+                    'preferredquality': '192',
+                }],
+                'keepvideo': False,
+            })
             
-            ydl_opts['outtmpl'] = os.path.join(self.temp_dir, '%(title)s.%(ext)s')
-            
-            logger.info(f"Descargando {media_type}: {url}")
+            logger.info(f"Descargando audio de: {url}")
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'descarga') if info else 'descarga'
+                title = info.get('title', 'audio') if info else 'audio'
             
-            # Buscar archivo descargado
+            # Buscar cualquier archivo de audio
             for root, dirs, files in os.walk(self.temp_dir):
                 for file in files:
-                    if file.endswith(f'.{file_ext}') or (media_type == 'video' and file.endswith(('.mp4', '.webm', '.mkv'))):
+                    if any(file.lower().endswith(ext) for ext in ['.mp3', '.m4a', '.webm', '.opus']):
                         self.output_path = os.path.join(root, file)
                         break
             
             if not self.output_path:
-                # Intentar encontrar cualquier archivo
+                # Buscar cualquier archivo
                 for root, dirs, files in os.walk(self.temp_dir):
                     for file in files:
                         self.output_path = os.path.join(root, file)
                         break
             
-            if not self.output_path or not os.path.exists(self.output_path):
-                return {'success': False, 'error': 'No se pudo generar el archivo'}
+            if not self.output_path:
+                return {'success': False, 'error': 'No se pudo generar el archivo de audio'}
             
             file_size = os.path.getsize(self.output_path)
             
@@ -281,52 +221,136 @@ class YouTubeDownloader:
                 return {'success': False, 'error': 'Archivo vacío'}
             
             if file_size > Config.MAX_FILE_SIZE:
-                return {'success': False, 'error': f'Archivo demasiado grande ({file_size/(1024*1024):.1f}MB)'}
+                os.remove(self.output_path)
+                return {'success': False, 'error': 'Archivo demasiado grande'}
             
-            # Sanitizar nombre y asegurar extensión correcta
+            # Renombrar a MP3 si es necesario
             clean_title = self.sanitize_filename(title)
-            actual_ext = os.path.splitext(self.output_path)[1]
-            final_filename = f"{clean_title}{actual_ext}"
-            final_path = os.path.join(self.temp_dir, final_filename)
+            new_filename = f"{clean_title}.mp3"
+            new_path = os.path.join(self.temp_dir, new_filename)
             
-            if self.output_path != final_path:
-                if os.path.exists(final_path):
-                    os.remove(final_path)
-                os.rename(self.output_path, final_path)
-                self.output_path = final_path
+            if os.path.exists(new_path):
+                os.remove(new_path)
             
+            # Cambiar extensión si no es MP3
+            if not self.output_path.endswith('.mp3'):
+                base_name = os.path.splitext(self.output_path)[0]
+                mp3_path = base_name + '.mp3'
+                if os.path.exists(mp3_path):
+                    self.output_path = mp3_path
+                else:
+                    os.rename(self.output_path, new_path)
+                    self.output_path = new_path
+            else:
+                os.rename(self.output_path, new_path)
+                self.output_path = new_path
+            
+            file_size = os.path.getsize(self.output_path)
             download_time = time.time() - start_time
             
             return {
                 'success': True,
-                'filename': final_filename,
+                'filename': new_filename,
                 'filepath': self.output_path,
                 'filesize': file_size,
                 'filesize_mb': round(file_size / (1024 * 1024), 2),
                 'download_time': round(download_time, 2),
                 'title': title,
-                'type': media_type,
-                'mimetype': mimetype,
-                'has_cookies': self.cookies_working
+                'type': 'audio',
+                'format': 'mp3'
             }
                 
-        except yt_dlp.utils.DownloadError as e:
-            error_msg = str(e)
-            if "format is not available" in error_msg:
-                return {'success': False, 'error': 'Formato solicitado no disponible'}
-            else:
-                return {'success': False, 'error': error_msg[:150]}
         except Exception as e:
-            logger.error(f"Error descargando {media_type}: {e}")
-            return {'success': False, 'error': f'Error al descargar {media_type}'}
+            logger.error(f"Error descargando audio: {e}")
+            return {'success': False, 'error': str(e)[:200]}
     
-    def download_audio(self, url: str, quality: str = '192') -> Dict[str, Any]:
-        """Descarga audio"""
-        return self._download_media(url, 'audio', quality)
-    
-    def download_video(self, url: str, quality: str = '720') -> Dict[str, Any]:
-        """Descarga video"""
-        return self._download_media(url, 'video', quality)
+    def download_video(self, url: str) -> Dict[str, Any]:
+        """Descarga video - USA CUALQUIER FORMATO DISPONIBLE"""
+        self.temp_dir = tempfile.mkdtemp(prefix="yt_video_")
+        start_time = time.time()
+        
+        try:
+            ydl_opts = self._get_base_options()
+            ydl_opts.update({
+                'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
+                # Formato MÁS FLEXIBLE: cualquier video disponible
+                'format': 'best[ext=mp4]/best',
+            })
+            
+            logger.info(f"Descargando video de: {url}")
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get('title', 'video') if info else 'video'
+            
+            # Buscar cualquier archivo de video
+            for root, dirs, files in os.walk(self.temp_dir):
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in ['.mp4', '.webm', '.mkv']):
+                        self.output_path = os.path.join(root, file)
+                        break
+            
+            if not self.output_path:
+                # Buscar cualquier archivo
+                for root, dirs, files in os.walk(self.temp_dir):
+                    for file in files:
+                        self.output_path = os.path.join(root, file)
+                        break
+            
+            if not self.output_path:
+                return {'success': False, 'error': 'No se pudo generar el archivo de video'}
+            
+            file_size = os.path.getsize(self.output_path)
+            
+            if file_size == 0:
+                return {'success': False, 'error': 'Archivo vacío'}
+            
+            if file_size > Config.MAX_FILE_SIZE:
+                os.remove(self.output_path)
+                return {'success': False, 'error': 'Archivo demasiado grande'}
+            
+            # Renombrar si es necesario
+            clean_title = self.sanitize_filename(title)
+            file_ext = os.path.splitext(self.output_path)[1] or '.mp4'
+            new_filename = f"{clean_title}{file_ext}"
+            new_path = os.path.join(self.temp_dir, new_filename)
+            
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            
+            if self.output_path != new_path:
+                os.rename(self.output_path, new_path)
+                self.output_path = new_path
+            
+            file_size = os.path.getsize(self.output_path)
+            download_time = time.time() - start_time
+            
+            # Determinar mimetype
+            if self.output_path.endswith('.mp4'):
+                mimetype = 'video/mp4'
+            elif self.output_path.endswith('.webm'):
+                mimetype = 'video/webm'
+            elif self.output_path.endswith('.mkv'):
+                mimetype = 'video/x-matroska'
+            else:
+                mimetype = 'application/octet-stream'
+            
+            return {
+                'success': True,
+                'filename': new_filename,
+                'filepath': self.output_path,
+                'filesize': file_size,
+                'filesize_mb': round(file_size / (1024 * 1024), 2),
+                'download_time': round(download_time, 2),
+                'title': title,
+                'type': 'video',
+                'format': file_ext.replace('.', ''),
+                'mimetype': mimetype
+            }
+                
+        except Exception as e:
+            logger.error(f"Error descargando video: {e}")
+            return {'success': False, 'error': str(e)[:200]}
     
     def cleanup(self):
         """Limpia archivos temporales"""
@@ -351,42 +375,63 @@ def home():
     """Endpoint principal"""
     return jsonify({
         'service': 'YouTube Downloader API',
-        'version': '3.0 - Render Optimized',
+        'version': '5.0 - Definitivo',
         'status': 'online',
-        'cookies': load_cookies_config() != {},
+        'has_cookies': os.path.exists(Config.COOKIES_FILE),
         'endpoints': {
             'GET /': 'Esta página',
             'GET /health': 'Estado del servidor',
-            'GET /info': 'Información del video',
+            'GET /info?url=URL': 'Información del video',
+            'POST /info': 'Información del video (POST también)',
             'POST /download/audio': 'Descargar audio MP3',
-            'POST /download/video': 'Descargar video MP4'
+            'POST /download/video': 'Descargar video'
         },
-        'limits': {
-            'max_file_size': f'{Config.MAX_FILE_SIZE/(1024*1024)}MB',
-            'timeout': '30 segundos'
-        }
+        'note': 'Usa cualquier formato disponible automáticamente'
     })
 
 @app.route('/health')
 def health():
-    """Health check para Render"""
+    """Health check"""
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'cookies': os.path.exists(Config.COOKIES_FILE)
+        'cookies_file_exists': os.path.exists(Config.COOKIES_FILE)
     })
 
-@app.route('/info', methods=['GET'])
+@app.route('/info', methods=['GET', 'POST'])
 def get_info():
-    """Obtiene información del video"""
+    """Obtiene información del video - ACEPTA GET Y POST"""
     try:
-        url = request.args.get('url', '').strip()
+        # Manejar tanto GET como POST
+        if request.method == 'POST':
+            if request.is_json:
+                data = request.get_json()
+            elif request.form:
+                data = request.form.to_dict()
+            else:
+                data = {}
+            
+            # También intentar leer del body si es texto plano
+            if not data.get('url'):
+                try:
+                    body_data = request.get_data(as_text=True)
+                    if body_data and 'http' in body_data:
+                        data['url'] = body_data.strip()
+                except:
+                    pass
+        else:  # GET
+            data = request.args.to_dict()
+        
+        url = data.get('url', '').strip()
         
         if not url:
             return jsonify({'success': False, 'error': 'URL requerida'}), 400
         
-        if 'youtube.com' not in url and 'youtu.be' not in url:
+        # Validación básica de URL
+        if not ('youtube.com' in url or 'youtu.be' in url):
             return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
+        
+        logger.info(f"Solicitud info para: {url[:50]}...")
         
         downloader = YouTubeDownloader()
         result = downloader.get_info(url)
@@ -396,50 +441,52 @@ def get_info():
         
     except Exception as e:
         logger.error(f"Error en /info: {e}")
-        return jsonify({'success': False, 'error': 'Error interno'}), 500
+        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
 @app.route('/download/audio', methods=['POST'])
 def download_audio():
     """Descarga audio MP3"""
     try:
-        # Obtener datos de la solicitud
+        # Manejar diferentes formatos de solicitud
         if request.is_json:
             data = request.get_json()
-        else:
+        elif request.form:
             data = request.form.to_dict()
+        else:
+            # Intentar leer como texto plano
+            body_text = request.get_data(as_text=True)
+            data = {'url': body_text.strip()} if body_text else {}
         
         url = data.get('url', '').strip()
-        quality = data.get('quality', '192')
         
         if not url:
             return jsonify({'success': False, 'error': 'URL requerida'}), 400
         
-        if 'youtube.com' not in url and 'youtu.be' not in url:
+        if not ('youtube.com' in url or 'youtu.be' in url):
             return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
         
-        logger.info(f"Solicitud de audio: {url[:50]}...")
+        logger.info(f"Solicitud audio para: {url[:50]}...")
         
         downloader = YouTubeDownloader()
-        result = downloader.download_audio(url, quality)
+        result = downloader.download_audio(url)
         
         if not result['success']:
             downloader.cleanup()
             return jsonify(result), 400
         
-        # Preparar respuesta con el archivo
+        # Preparar respuesta
         response = send_file(
             result['filepath'],
             as_attachment=True,
             download_name=result['filename'],
-            mimetype=result['mimetype']
+            mimetype='audio/mpeg'
         )
         
-        # Añadir headers informativos
+        # Headers informativos
         response.headers['X-Download-Time'] = str(result['download_time'])
         response.headers['X-File-Size'] = str(result['filesize'])
-        response.headers['X-Has-Cookies'] = str(result['has_cookies'])
         
-        # Limpiar después de enviar
+        # Configurar cleanup
         @response.call_on_close
         def cleanup_after_send():
             downloader.cleanup()
@@ -452,58 +499,49 @@ def download_audio():
 
 @app.route('/download/video', methods=['POST'])
 def download_video():
-    """Descarga video MP4"""
+    """Descarga video"""
     try:
-        # Obtener datos de la solicitud
+        # Manejar diferentes formatos de solicitud
         if request.is_json:
             data = request.get_json()
-        else:
+        elif request.form:
             data = request.form.to_dict()
+        else:
+            # Intentar leer como texto plano
+            body_text = request.get_data(as_text=True)
+            data = {'url': body_text.strip()} if body_text else {}
         
         url = data.get('url', '').strip()
-        quality = data.get('quality', '720')
         
         if not url:
             return jsonify({'success': False, 'error': 'URL requerida'}), 400
         
-        if 'youtube.com' not in url and 'youtu.be' not in url:
+        if not ('youtube.com' in url or 'youtu.be' in url):
             return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
         
-        logger.info(f"Solicitud de video ({quality}p): {url[:50]}...")
+        logger.info(f"Solicitud video para: {url[:50]}...")
         
         downloader = YouTubeDownloader()
-        result = downloader.download_video(url, quality)
+        result = downloader.download_video(url)
         
         if not result['success']:
             downloader.cleanup()
             return jsonify(result), 400
         
-        # Determinar mimetype basado en extensión
-        filename = result['filename']
-        if filename.endswith('.mp4'):
-            mimetype = 'video/mp4'
-        elif filename.endswith('.webm'):
-            mimetype = 'video/webm'
-        elif filename.endswith('.mkv'):
-            mimetype = 'video/x-matroska'
-        else:
-            mimetype = 'application/octet-stream'
-        
-        # Preparar respuesta con el archivo
+        # Preparar respuesta
         response = send_file(
             result['filepath'],
             as_attachment=True,
             download_name=result['filename'],
-            mimetype=mimetype
+            mimetype=result['mimetype']
         )
         
-        # Añadir headers informativos
+        # Headers informativos
         response.headers['X-Download-Time'] = str(result['download_time'])
         response.headers['X-File-Size'] = str(result['filesize'])
-        response.headers['X-Has-Cookies'] = str(result['has_cookies'])
-        response.headers['X-Quality'] = quality
+        response.headers['X-Video-Format'] = result['format']
         
-        # Limpiar después de enviar
+        # Configurar cleanup
         @response.call_on_close
         def cleanup_after_send():
             downloader.cleanup()
@@ -513,6 +551,20 @@ def download_video():
     except Exception as e:
         logger.error(f"Error en /download/video: {e}")
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
+
+@app.route('/test', methods=['GET'])
+def test():
+    """Endpoint de prueba"""
+    downloader = YouTubeDownloader()
+    result = downloader.get_info(Config.TEST_URL)
+    downloader.cleanup()
+    
+    return jsonify({
+        'test': 'success',
+        'server': 'running',
+        'test_url': Config.TEST_URL,
+        'video_info': result
+    })
 
 # ==============================
 # MANEJO DE ERRORES
@@ -534,38 +586,34 @@ def internal_error(error):
 # INICIALIZACIÓN
 # ==============================
 if __name__ == '__main__':
+    # SOLO para desarrollo local
+    # En Render, se ejecuta con: gunicorn app:app
+    
     print("\n" + "="*60)
-    print("🚀 SERVIDOR YOUTUBE PARA RENDER.COM")
+    print("🚀 SERVIDOR YOUTUBE - VERSIÓN DEFINITIVA")
     print("="*60)
     print(f"✅ Puerto: {Config.PORT}")
     print(f"✅ Host: {Config.HOST}")
     
-    # Verificar cookies
     if os.path.exists(Config.COOKIES_FILE):
         print(f"✅ Cookies: {Config.COOKIES_FILE} encontrado")
     else:
         print("⚠️  Cookies: No encontrado (modo guest)")
     
     print("="*60)
-    print("📡 Endpoints disponibles:")
-    print("  GET  /               - Información del API")
-    print("  GET  /health         - Estado del servidor")
-    print("  GET  /info?url=URL   - Información del video")
-    print("  POST /download/audio - Descargar audio MP3")
-    print("  POST /download/video - Descargar video MP4")
+    print("📡 Endpoints:")
+    print("  GET/POST /info          - Información del video")
+    print("  POST /download/audio    - Descargar audio MP3")
+    print("  POST /download/video    - Descargar video")
+    print("="*60)
+    print("\n⚠️  NOTA: En Render se ejecuta con 'gunicorn app:app'")
     print("="*60 + "\n")
     
-    # Usar Waitress para producción (compatible con Render)
-    try:
-        from waitress import serve
-        print("🚀 Iniciando con Waitress (producción)...")
-        serve(app, host=Config.HOST, port=Config.PORT)
-    except ImportError:
-        print("⚠️  Waitress no disponible, usando servidor de desarrollo...")
-        app.run(
-            host=Config.HOST,
-            port=Config.PORT,
-            debug=False,
-            threaded=True,
-            use_reloader=False
-        )
+    # Solo ejecutar en desarrollo local
+    app.run(
+        host=Config.HOST,
+        port=Config.PORT,
+        debug=False,
+        threaded=True,
+        use_reloader=False
+    )
