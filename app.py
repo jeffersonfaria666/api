@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 7.0
-Versión: 7.0 - Método garantizado basado en bot funcional
+🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 8.0
+Versión: 8.0 - Correcciones para TikTok y YouTube con yt-dlp actualizado
 """
 
 import os
@@ -12,6 +12,7 @@ import tempfile
 import shutil
 import time
 import re
+import subprocess
 from datetime import datetime
 from typing import Dict, Any
 
@@ -43,10 +44,25 @@ def setup_logging():
 logger = setup_logging()
 
 # ==============================
-# MÉTODO GARANTIZADO DE DESCARGA
+# ACTUALIZAR YT-DLP AL INICIAR
 # ==============================
-class GuaranteedDownloader:
-    """Descargador garantizado basado en bot funcional"""
+def update_ytdlp():
+    """Actualiza yt-dlp a la última versión"""
+    try:
+        logger.info("🔄 Comprobando actualización de yt-dlp...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"])
+        logger.info("✅ yt-dlp actualizado correctamente")
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo actualizar yt-dlp: {e}")
+
+# Actualizar al inicio
+update_ytdlp()
+
+# ==============================
+# MÉTODO CORREGIDO DE DESCARGA
+# ==============================
+class FixedDownloader:
+    """Descargador con correcciones para TikTok y YouTube"""
     
     def __init__(self):
         self.temp_dir = None
@@ -62,14 +78,51 @@ class GuaranteedDownloader:
         return filename
     
     def get_info(self, url: str) -> Dict[str, Any]:
-        """Obtiene información del video"""
+        """Obtiene información del video con configuración robusta"""
         try:
+            # Configuración común para todas las plataformas
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
-                'forcejson': True
+                'extract_flat': False,
+                'forcejson': True,
+                'no_check_certificate': True,
+                'ignoreerrors': True,
+                'socket_timeout': 15,
+                'retries': 5,
+                'fragment_retries': 5,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
             }
+            
+            # Configuración específica para TikTok
+            if 'tiktok.com' in url:
+                ydl_opts.update({
+                    'extractor_args': {
+                        'tiktok': {
+                            'app_version': '30.2.0',
+                            'manifest_app_version': '30.2.0',
+                        }
+                    }
+                })
+            # Configuración específica para YouTube
+            elif 'youtube.com' in url or 'youtu.be' in url:
+                ydl_opts.update({
+                    'extractor_args': {
+                        'youtube': {
+                            'player_client': ['android', 'web'],
+                            'player_skip': ['configs', 'js'],
+                        }
+                    }
+                })
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -96,39 +149,65 @@ class GuaranteedDownloader:
                     'uploader': info.get('uploader', 'Desconocido'),
                     'view_count': info.get('view_count', 0),
                     'thumbnail': info.get('thumbnail', ''),
+                    'platform': 'TikTok' if 'tiktok.com' in url else 'YouTube'
                 }
                 
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"Error específico obteniendo info: {e}")
+            return {'success': False, 'error': f'Error del servicio: {str(e)}'}
         except Exception as e:
             logger.error(f"Error obteniendo info: {e}")
             return {'success': False, 'error': f'Error: {str(e)}'}
     
-    def _get_ydl_options(self, download_type: str):
-        """Obtiene las opciones de yt-dlp según el tipo"""
+    def _get_download_options(self, url: str, download_type: str):
+        """Obtiene opciones de descarga específicas para la URL y tipo"""
+        # Opciones base comunes
         base_opts = {
             'quiet': True,
             'no_warnings': True,
             'no_color': True,
             'noprogress': True,
+            'no_check_certificate': True,
+            'ignoreerrors': True,
             'socket_timeout': 30,
             'retries': 10,
             'fragment_retries': 10,
+            'concurrent_fragment_downloads': 4,
+            'buffersize': 1024 * 1024,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': '*/*',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate',
-            },
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios'],
-                    'player_skip': ['js', 'configs']
-                }
+                'DNT': '1',
+                'Connection': 'keep-alive',
             },
         }
         
+        # Configuración específica para TikTok
+        if 'tiktok.com' in url:
+            base_opts.update({
+                'extractor_args': {
+                    'tiktok': {
+                        'app_version': '30.2.0',
+                        'manifest_app_version': '30.2.0',
+                    }
+                }
+            })
+        # Configuración específica para YouTube
+        elif 'youtube.com' in url or 'youtu.be' in url:
+            base_opts.update({
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'web'],
+                        'player_skip': ['configs', 'js'],
+                    }
+                }
+            })
+        
+        # Configuración según el tipo de descarga
         if download_type == "audio":
-            return {
-                **base_opts,
+            base_opts.update({
                 'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -136,195 +215,212 @@ class GuaranteedDownloader:
                     'preferredquality': '192',
                 }],
                 'keepvideo': False,
-            }
+            })
         elif download_type == "video":
-            return {
-                **base_opts,
-                'format': 'best',
+            base_opts.update({
+                'format': 'best[ext=mp4]/best',
                 'merge_output_format': 'mp4',
-            }
+            })
         else:  # "best"
-            return {
-                **base_opts,
-                'format': 'bestvideo+bestaudio/best',
+            base_opts.update({
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                 'merge_output_format': 'mp4',
-            }
+            })
+        
+        return base_opts
     
     def download(self, url: str, download_type: str = "best") -> Dict[str, Any]:
-        """MÉTODO GARANTIZADO - Descarga directa y funcional"""
+        """MÉTODO CORREGIDO - Descarga con configuración robusta"""
         self.temp_dir = tempfile.mkdtemp(prefix="ytdl_", dir="/tmp")
         start_time = time.time()
         
         try:
-            # Primero obtener información del video
-            ydl_info_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-                'forcejson': True
-            }
+            timestamp = int(time.time())
+            base_filename = f"download_{timestamp}"
             
-            with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            # Configurar opciones de descarga
+            ydl_opts = self._get_download_options(url, download_type)
+            ydl_opts['outtmpl'] = os.path.join(self.temp_dir, f'{base_filename}.%(ext)s')
+            
+            logger.info(f"Iniciando descarga: {url} - Tipo: {download_type}")
+            
+            # Realizar la descarga
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
                 
                 if not info:
-                    return {'success': False, 'error': 'No se pudo obtener información del video'}
-                
-                video_title = info.get('title', 'video')
-                safe_title = self.sanitize_filename(video_title)
-                
-                # Crear nombre de archivo base
-                timestamp = int(time.time())
-                base_filename = f"download_{timestamp}"
-                
-                # Configurar opciones de descarga
-                ydl_opts = self._get_ydl_options(download_type)
-                ydl_opts['outtmpl'] = os.path.join(self.temp_dir, f'{base_filename}.%(ext)s')
-                
-                logger.info(f"Iniciando descarga garantizada: {url} - Tipo: {download_type}")
-                
-                # Realizar la descarga
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                
-                # Buscar archivo descargado
-                downloaded_files = []
-                for root, dirs, files in os.walk(self.temp_dir):
-                    for file in files:
-                        filepath = os.path.join(root, file)
-                        try:
-                            if os.path.getsize(filepath) > 1024:  # Al menos 1KB
-                                downloaded_files.append(filepath)
-                        except:
-                            continue
-                
-                if not downloaded_files:
-                    return {'success': False, 'error': 'No se generó ningún archivo válido'}
-                
-                # Seleccionar el archivo más grande
-                self.output_path = max(downloaded_files, key=lambda x: os.path.getsize(x))
-                file_size = os.path.getsize(self.output_path)
-                
-                if file_size == 0:
-                    return {'success': False, 'error': 'Archivo vacío'}
-                
-                if file_size > Config.MAX_FILE_SIZE:
-                    os.remove(self.output_path)
-                    return {'success': False, 'error': f'Archivo demasiado grande ({file_size/(1024*1024):.2f}MB > 200MB)'}
-                
-                # Renombrar archivo con título del video
-                file_ext = os.path.splitext(self.output_path)[1]
-                if download_type == "audio" and not file_ext.lower().endswith('.mp3'):
+                    return {'success': False, 'error': 'No se pudo procesar el video'}
+            
+            # Buscar archivo descargado
+            downloaded_files = []
+            for root, dirs, files in os.walk(self.temp_dir):
+                for file in files:
+                    if file.endswith(('.part', '.ytdl')):
+                        continue  # Ignorar archivos parciales
+                    filepath = os.path.join(root, file)
+                    try:
+                        file_size = os.path.getsize(filepath)
+                        if file_size > 1024:  # Al menos 1KB
+                            downloaded_files.append((filepath, file_size))
+                    except:
+                        continue
+            
+            if not downloaded_files:
+                return {'success': False, 'error': 'No se generó ningún archivo válido'}
+            
+            # Seleccionar el archivo más grande
+            self.output_path, file_size = max(downloaded_files, key=lambda x: x[1])
+            
+            if file_size == 0:
+                return {'success': False, 'error': 'Archivo vacío'}
+            
+            if file_size > Config.MAX_FILE_SIZE:
+                os.remove(self.output_path)
+                return {'success': False, 'error': f'Archivo demasiado grande ({file_size/(1024*1024):.2f}MB > 200MB)'}
+            
+            # Renombrar archivo con título del video
+            video_title = info.get('title', 'video') if info else 'video'
+            safe_title = self.sanitize_filename(video_title)
+            
+            file_ext = os.path.splitext(self.output_path)[1].lower()
+            if download_type == "audio":
+                if file_ext != '.mp3':
                     new_filename = f"{safe_title}.mp3"
-                elif download_type == "video" and not file_ext.lower().endswith('.mp4'):
-                    new_filename = f"{safe_title}.mp4"
+                    new_path = os.path.join(self.temp_dir, new_filename)
+                    # Si ya existe un archivo MP3, usarlo
+                    for f, _ in downloaded_files:
+                        if f.lower().endswith('.mp3'):
+                            self.output_path = f
+                            file_ext = '.mp3'
+                            break
+                    else:
+                        # Si no hay MP3, renombrar el archivo actual
+                        os.rename(self.output_path, new_path)
+                        self.output_path = new_path
                 else:
-                    new_filename = f"{safe_title}{file_ext}"
-                
-                # Asegurar nombre único
-                counter = 1
-                original_new_filename = new_filename
-                while os.path.exists(os.path.join(self.temp_dir, new_filename)):
-                    name, ext = os.path.splitext(original_new_filename)
-                    new_filename = f"{name}_{counter}{ext}"
-                    counter += 1
-                
-                new_path = os.path.join(self.temp_dir, new_filename)
-                os.rename(self.output_path, new_path)
-                self.output_path = new_path
-                
-                download_time = time.time() - start_time
-                
-                return {
-                    'success': True,
-                    'filename': new_filename,
-                    'filepath': new_path,
-                    'filesize': file_size,
-                    'filesize_mb': round(file_size / (1024 * 1024), 2),
-                    'download_time': round(download_time, 2),
-                    'title': video_title,
-                    'temp_dir': self.temp_dir,
-                    'type': download_type
-                }
+                    new_filename = f"{safe_title}.mp3"
+                    new_path = os.path.join(self.temp_dir, new_filename)
+                    os.rename(self.output_path, new_path)
+                    self.output_path = new_path
+            else:  # video o best
+                if file_ext != '.mp4':
+                    # Buscar si hay un MP4
+                    mp4_files = [(f, s) for f, s in downloaded_files if f.lower().endswith('.mp4')]
+                    if mp4_files:
+                        self.output_path, file_size = max(mp4_files, key=lambda x: x[1])
+                        file_ext = '.mp4'
+                    
+                    new_filename = f"{safe_title}.mp4"
+                    new_path = os.path.join(self.temp_dir, new_filename)
+                    os.rename(self.output_path, new_path)
+                    self.output_path = new_path
+                else:
+                    new_filename = f"{safe_title}.mp4"
+                    new_path = os.path.join(self.temp_dir, new_filename)
+                    os.rename(self.output_path, new_path)
+                    self.output_path = new_path
+            
+            download_time = time.time() - start_time
+            
+            return {
+                'success': True,
+                'filename': os.path.basename(self.output_path),
+                'filepath': self.output_path,
+                'filesize': file_size,
+                'filesize_mb': round(file_size / (1024 * 1024), 2),
+                'download_time': round(download_time, 2),
+                'title': video_title,
+                'temp_dir': self.temp_dir,
+                'type': download_type,
+                'platform': 'TikTok' if 'tiktok.com' in url else 'YouTube'
+            }
                 
         except yt_dlp.utils.DownloadError as e:
             error_msg = str(e)
             logger.error(f"Error de descarga: {error_msg}")
             
-            # Intentar método simplificado si falla
-            return self._simple_method(url, download_type, start_time)
+            # Intentar método alternativo
+            return self._alternative_method(url, download_type, start_time)
             
         except Exception as e:
             logger.error(f"Error inesperado: {e}", exc_info=True)
             return {'success': False, 'error': f'Error interno: {str(e)}'}
     
-    def _simple_method(self, url: str, download_type: str, start_time: float) -> Dict[str, Any]:
-        """Método simplificado y garantizado"""
+    def _alternative_method(self, url: str, download_type: str, start_time: float) -> Dict[str, Any]:
+        """Método alternativo simplificado"""
         try:
-            logger.info("Intentando método simplificado...")
+            logger.info("Intentando método alternativo...")
             
-            # Configuración mínima y garantizada
+            # Configuración mínima y directa
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'no_color': True,
-                'outtmpl': os.path.join(self.temp_dir, '%(id)s.%(ext)s'),
+                'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
+                'no_check_certificate': True,
                 'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 },
             }
             
-            if download_type == "audio":
-                ydl_opts['format'] = 'worstaudio/worst'
+            # Formato específico
+            if 'tiktok.com' in url:
+                ydl_opts['format'] = 'download_addr'
+            elif download_type == "audio":
+                ydl_opts['format'] = 'bestaudio'
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                }]
             else:
-                ydl_opts['format'] = 'worst'
+                ydl_opts['format'] = 'best[ext=mp4]'
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                
-                # Buscar cualquier archivo descargado
-                for root, dirs, files in os.walk(self.temp_dir):
-                    for file in files:
-                        if file.endswith(('.mp4', '.mp3', '.webm', '.m4a', '.mp4.part', '.webm.part')):
-                            filepath = os.path.join(root, file)
-                            if file.endswith('.part'):
-                                # Renombrar archivo parcial
-                                new_path = filepath.replace('.part', '')
+            
+            # Buscar archivos
+            for root, dirs, files in os.walk(self.temp_dir):
+                for file in files:
+                    if file.endswith(('.mp4', '.mp3', '.webm', '.m4a')):
+                        filepath = os.path.join(root, file)
+                        file_size = os.path.getsize(filepath)
+                        
+                        if file_size > 1024:
+                            download_time = time.time() - start_time
+                            
+                            # Renombrar si es necesario
+                            video_title = info.get('title', 'video') if info else 'video'
+                            safe_title = self.sanitize_filename(video_title)
+                            file_ext = os.path.splitext(filepath)[1]
+                            
+                            if download_type == "audio" and not file_ext.lower().endswith('.mp3'):
+                                new_filename = f"{safe_title}.mp3"
+                                new_path = os.path.join(self.temp_dir, new_filename)
+                                os.rename(filepath, new_path)
+                                filepath = new_path
+                            elif download_type == "video" and not file_ext.lower().endswith('.mp4'):
+                                new_filename = f"{safe_title}.mp4"
+                                new_path = os.path.join(self.temp_dir, new_filename)
                                 os.rename(filepath, new_path)
                                 filepath = new_path
                             
-                            file_size = os.path.getsize(filepath)
+                            self.output_path = filepath
                             
-                            if file_size > 1024:
-                                download_time = time.time() - start_time
-                                
-                                # Renombrar con título
-                                video_title = info.get('title', 'video') if info else 'video'
-                                safe_title = self.sanitize_filename(video_title)
-                                file_ext = os.path.splitext(filepath)[1]
-                                
-                                if download_type == "audio" and not file_ext.lower().endswith('.mp3'):
-                                    new_filename = f"{safe_title}.mp3"
-                                    new_path = os.path.join(self.temp_dir, new_filename)
-                                    os.rename(filepath, new_path)
-                                    filepath = new_path
-                                
-                                return {
-                                    'success': True,
-                                    'filename': os.path.basename(filepath),
-                                    'filepath': filepath,
-                                    'filesize': file_size,
-                                    'filesize_mb': round(file_size / (1024 * 1024), 2),
-                                    'download_time': round(download_time, 2),
-                                    'title': video_title,
-                                    'temp_dir': self.temp_dir,
-                                    'type': download_type
-                                }
-                
-                return {'success': False, 'error': 'Método simplificado no generó archivos'}
+                            return {
+                                'success': True,
+                                'filename': os.path.basename(filepath),
+                                'filepath': filepath,
+                                'filesize': file_size,
+                                'filesize_mb': round(file_size / (1024 * 1024), 2),
+                                'download_time': round(download_time, 2),
+                                'title': video_title,
+                                'temp_dir': self.temp_dir,
+                                'type': download_type
+                            }
+            
+            return {'success': False, 'error': 'Método alternativo no generó archivos'}
                 
         except Exception as e:
-            logger.error(f"Error en método simplificado: {e}")
+            logger.error(f"Error en método alternativo: {e}")
             return {'success': False, 'error': 'Todos los métodos fallaron'}
     
     def cleanup(self):
@@ -350,9 +446,9 @@ def home():
     """Página principal"""
     return jsonify({
         'service': 'YouTube/TikTok Downloader',
-        'version': '7.0',
+        'version': '8.0',
         'status': 'online',
-        'method': 'garantizado',
+        'features': 'Corregido para TikTok y YouTube',
         'endpoints': {
             '/health': 'GET - Health check',
             '/info': 'POST {"url": "video_url"}',
@@ -367,7 +463,7 @@ def health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'method': 'garantizado'
+        'ytdlp_version': yt_dlp.version.__version__ if hasattr(yt_dlp, 'version') else 'unknown'
     })
 
 @app.route('/info', methods=['POST', 'GET'])
@@ -388,6 +484,7 @@ def get_info():
         patterns = [
             r'https?://(www\.)?tiktok\.com/',
             r'https?://vm\.tiktok\.com/',
+            r'https?://vt\.tiktok\.com/',
             r'https?://(www\.)?youtube\.com/',
             r'https?://youtu\.be/'
         ]
@@ -395,7 +492,7 @@ def get_info():
         if not any(re.match(pattern, url) for pattern in patterns):
             return jsonify({'success': False, 'error': 'URL no válida. Solo se admiten TikTok o YouTube'}), 400
         
-        downloader = GuaranteedDownloader()
+        downloader = FixedDownloader()
         result = downloader.get_info(url)
         downloader.cleanup()
         
@@ -407,7 +504,7 @@ def get_info():
 
 @app.route('/download', methods=['POST'])
 def download():
-    """Endpoint de descarga principal - GARANTIZADO"""
+    """Endpoint de descarga principal - CORREGIDO"""
     try:
         data = request.get_json(silent=True) or request.form
         
@@ -424,6 +521,7 @@ def download():
         patterns = [
             r'https?://(www\.)?tiktok\.com/',
             r'https?://vm\.tiktok\.com/',
+            r'https?://vt\.tiktok\.com/',
             r'https?://(www\.)?youtube\.com/',
             r'https?://youtu\.be/'
         ]
@@ -437,7 +535,7 @@ def download():
         logger.info(f"Solicitud de descarga: {url} - Tipo: {download_type}")
         
         # Crear descargador
-        downloader = GuaranteedDownloader()
+        downloader = FixedDownloader()
         
         # Ejecutar descarga
         result = downloader.download(url, download_type)
@@ -487,6 +585,7 @@ def download():
                 'X-Download-Time': str(result['download_time']),
                 'X-File-Size': str(file_size),
                 'X-File-Type': download_type,
+                'X-Platform': result.get('platform', 'unknown')
             }
         )
         
@@ -505,7 +604,7 @@ def quick_download():
             return jsonify({'success': False, 'error': 'Se requiere parámetro ?url='}), 400
         
         # Información del video primero
-        downloader = GuaranteedDownloader()
+        downloader = FixedDownloader()
         info = downloader.get_info(url)
         downloader.cleanup()
         
@@ -527,13 +626,13 @@ def quick_download():
         logger.error(f"Error en /quick: {e}")
         return jsonify({'success': False, 'error': 'Error del servidor'}), 500
 
-@app.route('/test', methods=['GET'])
-def test():
-    """Endpoint de prueba con video conocido"""
-    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+@app.route('/test/tiktok', methods=['GET'])
+def test_tiktok():
+    """Endpoint de prueba para TikTok"""
+    test_url = "https://vm.tiktok.com/ZMD1m322D/"
     
     try:
-        downloader = GuaranteedDownloader()
+        downloader = FixedDownloader()
         
         # Probar información
         info = downloader.get_info(test_url)
@@ -541,7 +640,56 @@ def test():
         if not info.get('success'):
             downloader.cleanup()
             return jsonify({
-                'test': 'info_failed',
+                'test': 'tiktok_info_failed',
+                'error': info.get('error')
+            })
+        
+        # Probar descarga de video
+        video_result = downloader.download(test_url, 'video')
+        
+        if video_result.get('success'):
+            video_file = video_result.get('filename')
+            video_size = video_result.get('filesize_mb', 0)
+            downloader.cleanup()
+            
+            return jsonify({
+                'test': 'tiktok_success',
+                'info': info,
+                'video': {
+                    'success': video_result.get('success'),
+                    'filename': video_file,
+                    'size_mb': video_size
+                }
+            })
+        else:
+            downloader.cleanup()
+            return jsonify({
+                'test': 'tiktok_download_failed',
+                'info': info,
+                'video_error': video_result.get('error')
+            })
+            
+    except Exception as e:
+        return jsonify({
+            'test': 'tiktok_error',
+            'error': str(e)
+        })
+
+@app.route('/test/youtube', methods=['GET'])
+def test_youtube():
+    """Endpoint de prueba para YouTube"""
+    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    
+    try:
+        downloader = FixedDownloader()
+        
+        # Probar información
+        info = downloader.get_info(test_url)
+        
+        if not info.get('success'):
+            downloader.cleanup()
+            return jsonify({
+                'test': 'youtube_info_failed',
                 'error': info.get('error')
             })
         
@@ -554,14 +702,14 @@ def test():
             downloader.cleanup()
             
             # Crear nuevo descargador para video
-            downloader2 = GuaranteedDownloader()
+            downloader2 = FixedDownloader()
             video_result = downloader2.download(test_url, 'video')
             video_file = video_result.get('filename') if video_result.get('success') else None
             video_size = video_result.get('filesize_mb', 0) if video_result.get('success') else 0
             downloader2.cleanup()
             
             return jsonify({
-                'test': 'success',
+                'test': 'youtube_success',
                 'info': info,
                 'audio': {
                     'success': audio_result.get('success'),
@@ -577,15 +725,14 @@ def test():
         else:
             downloader.cleanup()
             return jsonify({
-                'test': 'download_failed',
+                'test': 'youtube_download_failed',
                 'info': info,
-                'audio_error': audio_result.get('error'),
-                'note': 'El servidor está funcionando pero la descarga falló'
+                'audio_error': audio_result.get('error')
             })
             
     except Exception as e:
         return jsonify({
-            'test': 'error',
+            'test': 'youtube_error',
             'error': str(e)
         })
 
@@ -610,13 +757,18 @@ def internal_error(error):
 # ==============================
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 7.0")
+    print("🚀 SERVIDOR YOUTUBE/TIKTOK - VERSIÓN 8.0")
     print("="*60)
-    print("✅ Método garantizado basado en bot funcional")
-    print("✅ Configuración optimizada y probada")
-    print("✅ Simple y efectivo")
+    print("✅ Corregido para TikTok (error sigi)")
+    print("✅ Corregido para YouTube (error login)")
+    print("✅ yt-dlp actualizado automáticamente")
+    print("✅ Configuración robusta y optimizada")
     print("="*60)
     print(f"📡 Servidor: http://{Config.HOST}:{Config.PORT}")
+    print("="*60)
+    print("📊 Endpoints de prueba:")
+    print("  /test/tiktok - Probar descarga de TikTok")
+    print("  /test/youtube - Probar descarga de YouTube")
     print("="*60 + "\n")
     
     app.run(
