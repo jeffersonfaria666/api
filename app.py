@@ -12,13 +12,16 @@ from yt_dlp import YoutubeDL
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters
 from telegram.error import BadRequest, RetryAfter
+from flask import Flask, jsonify, request
+from threading import Thread
+import json
 
 # Configuración
 BOT_TOKEN = "7239423213:AAE6lmCeiuz9_GoeujWDYo64B0FOfcHoFFA"
 USDT_ADDRESS = "0x594EAB95D5683851E0eBFfC457C07dc217Bf4830".lower()
 BSC_API_KEY = "9769MICJ2Z1PAEZVVZCX9HKYSIRWVYZA"
 LIMIT_POR_DIA = 100
-MIN_USDT = 4.99  # Cambiado a 4.99 para coincidir con el precio
+MIN_USDT = 4.99
 DB_NAME = "usuarios.db"
 MAX_WORKERS = 3
 MAX_FRAGMENTS = 16
@@ -26,6 +29,11 @@ CHUNK_SIZE = 10 * 1024 * 1024
 MAX_FILE_SIZE = 7000 * 1024 * 1024  
 ADMIN_IDS = []
 MIN_WITHDRAWAL = 50
+
+# Configuración API
+API_HOST = "0.0.0.0"
+API_PORT = int(os.environ.get("PORT", 5000))  # Usar puerto de Render o 5000 por defecto
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "default_secret_key_change_in_production")
 
 # Sistema de recompensas
 REWARD_PER_DOWNLOAD_MIN = 0.01
@@ -46,6 +54,10 @@ download_jobs = {}
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 current_downloads = {}
 progress_trackers = {}
+
+# Inicializar Flask app para API
+api_app = Flask(__name__)
+api_app.secret_key = API_SECRET_KEY
 
 # Sistema de colas mejorado
 class DownloadQueueSystem:
@@ -263,7 +275,9 @@ stats = {
     "errors": 0,
     "total_rewards": 0.0,
     "total_withdrawals": 0.0,
-    "total_referral_earnings": 0.0
+    "total_referral_earnings": 0.0,
+    "api_requests": 0,
+    "last_api_request": None
 }
 
 translations = {
@@ -369,6 +383,398 @@ translations = {
     }
 }
 
+# ===========================================
+# FUNCIONES PARA LA API
+# ===========================================
+
+def obtener_estadisticas_db():
+    """Obtiene estadísticas detalladas de la base de datos"""
+    conn = conectar_db()
+    cur = conn.cursor()
+    
+    # Estadísticas generales
+    cur.execute("SELECT COUNT(*) FROM usuarios")
+    total_usuarios = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM usuarios WHERE premium = 1")
+    premium_usuarios = cur.fetchone()[0]
+    
+    cur.execute("SELECT SUM(descargas) FROM usuarios")
+    total_descargas = cur.fetchone()[0] or 0
+    
+    cur.execute("SELECT SUM(balance) FROM usuarios")
+    total_balance = cur.fetchone()[0] or 0.0
+    
+    cur.execute("SELECT SUM(total_earned) FROM usuarios")
+    total_ganado = cur.fetchone()[0] or 0.0
+    
+    cur.execute("SELECT SUM(referral_earnings) FROM usuarios")
+    total_referidos = cur.fetchone()[0] or 0.0
+    
+    cur.execute("SELECT COUNT(DISTINCT id) FROM usuarios WHERE last_active > ?", (int(time.time()) - 86400,))
+    activos_24h = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'")
+    retiros_pendientes = cur.fetchone()[0]
+    
+    cur.execute("SELECT SUM(amount) FROM withdrawals WHERE status = 'completed'")
+    retiros_completados = cur.fetchone()[0] or 0.0
+    
+    # Top usuarios
+    cur.execute("SELECT username, descargas, balance, premium FROM usuarios ORDER BY descargas DESC LIMIT 10")
+    top_usuarios = []
+    for row in cur.fetchall():
+        top_usuarios.append({
+            "username": row[0] or "Sin nombre",
+            "descargas": row[1],
+            "balance": row[2],
+            "premium": bool(row[3])
+        })
+    
+    conn.close()
+    
+    return {
+        "total_usuarios": total_usuarios,
+        "premium_usuarios": premium_usuarios,
+        "total_descargas": total_descargas,
+        "total_balance": total_balance,
+        "total_ganado": total_ganado,
+        "total_referidos": total_referidos,
+        "activos_24h": activos_24h,
+        "retiros_pendientes": retiros_pendientes,
+        "retiros_completados": retiros_completados,
+        "top_usuarios": top_usuarios
+    }
+
+def obtener_estado_sistema():
+    """Obtiene el estado actual del sistema"""
+    ahora = datetime.now()
+    uptime = time.time() - stats["start_time"]
+    horas, resto = divmod(uptime, 3600)
+    minutos, segundos = divmod(resto, 60)
+    
+    return {
+        "estado": "🟢 Activo" if stats["active_downloads"] > 0 or stats["queue_size"] > 0 else "🟡 En espera",
+        "uptime": f"{int(horas)}h {int(minutos)}m {int(segundos)}s",
+        "tiempo_activo": uptime,
+        "hora_servidor": ahora.strftime("%Y-%m-%d %H:%M:%S"),
+        "ultimo_reinicio": datetime.fromtimestamp(stats["start_time"]).strftime("%Y-%m-%d %H:%M:%S"),
+        "api_requests": stats["api_requests"],
+        "ultima_api_request": stats["last_api_request"]
+    }
+
+def verificar_autenticacion(auth_header):
+    """Verifica la autenticación de la API"""
+    if not auth_header:
+        return False
+    
+    try:
+        # Formato: Bearer {API_SECRET_KEY}
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            return token == API_SECRET_KEY
+    except:
+        pass
+    
+    return False
+
+# ===========================================
+# ENDPOINTS DE LA API
+# ===========================================
+
+@api_app.route('/')
+def index():
+    """Página principal de la API"""
+    return jsonify({
+        "api": "Bot de Descargas - API de Monitoreo",
+        "version": "1.0.0",
+        "endpoints": {
+            "/api/status": "Estado general del sistema",
+            "/api/stats": "Estadísticas detalladas",
+            "/api/users": "Información de usuarios",
+            "/api/queue": "Estado de la cola de descargas",
+            "/api/health": "Verificación de salud del sistema"
+        },
+        "documentation": "Usa Bearer token para autenticación"
+    })
+
+@api_app.route('/api/status', methods=['GET'])
+def api_status():
+    """Endpoint para estado general del sistema"""
+    stats["api_requests"] += 1
+    stats["last_api_request"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    auth_header = request.headers.get('Authorization')
+    if not verificar_autenticacion(auth_header):
+        return jsonify({"error": "No autorizado"}), 401
+    
+    estado_sistema = obtener_estado_sistema()
+    
+    return jsonify({
+        "sistema": estado_sistema,
+        "estadisticas_activas": {
+            "descargas_totales": stats["total_downloads"],
+            "descargas_hoy": stats["daily_downloads"],
+            "usuarios_unicos": len(stats["unique_users"]),
+            "usuarios_premium": stats["premium_users"],
+            "descargas_activas": stats["active_downloads"],
+            "en_cola": stats["queue_size"],
+            "completadas_hoy": stats["completed_today"],
+            "errores": stats["errors"],
+            "recompensas": stats["total_rewards"],
+            "retiros": stats["total_withdrawals"],
+            "ganancias_referidos": stats["total_referral_earnings"]
+        }
+    })
+
+@api_app.route('/api/stats', methods=['GET'])
+def api_stats():
+    """Endpoint para estadísticas detalladas"""
+    stats["api_requests"] += 1
+    stats["last_api_request"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    auth_header = request.headers.get('Authorization')
+    if not verificar_autenticacion(auth_header):
+        return jsonify({"error": "No autorizado"}), 401
+    
+    estadisticas_db = obtener_estadisticas_db()
+    estado_sistema = obtener_estado_sistema()
+    
+    return jsonify({
+        "estadisticas_generales": estadisticas_db,
+        "estado_sistema": estado_sistema,
+        "estadisticas_tiempo_real": {
+            "descargas_hoy": stats["daily_downloads"],
+            "descargas_activas": stats["active_downloads"],
+            "tareas_en_cola": stats["queue_size"],
+            "errores_hoy": stats["errors"]
+        }
+    })
+
+@api_app.route('/api/users', methods=['GET'])
+def api_users():
+    """Endpoint para información de usuarios"""
+    stats["api_requests"] += 1
+    stats["last_api_request"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    auth_header = request.headers.get('Authorization')
+    if not verificar_autenticacion(auth_header):
+        return jsonify({"error": "No autorizado"}), 401
+    
+    conn = conectar_db()
+    cur = conn.cursor()
+    
+    # Parámetros de consulta
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    
+    cur.execute("""
+        SELECT id, username, descargas, youtube_descargas, premium, 
+               referrals, balance, total_earned, referral_earnings,
+               datetime(last_active, 'unixepoch') as ultima_actividad
+        FROM usuarios 
+        ORDER BY descargas DESC 
+        LIMIT ? OFFSET ?
+    """, (limit, offset))
+    
+    usuarios = []
+    for row in cur.fetchall():
+        usuarios.append({
+            "id": row[0],
+            "username": row[1] or "Sin nombre",
+            "descargas": row[2],
+            "youtube_descargas": row[3],
+            "premium": bool(row[4]),
+            "referrals": row[5],
+            "balance": row[6],
+            "total_earned": row[7],
+            "referral_earnings": row[8],
+            "ultima_actividad": row[9]
+        })
+    
+    # Total de usuarios para paginación
+    cur.execute("SELECT COUNT(*) FROM usuarios")
+    total = cur.fetchone()[0]
+    
+    conn.close()
+    
+    return jsonify({
+        "usuarios": usuarios,
+        "paginacion": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "pagina_actual": (offset // limit) + 1,
+            "total_paginas": (total + limit - 1) // limit
+        }
+    })
+
+@api_app.route('/api/queue', methods=['GET'])
+def api_queue():
+    """Endpoint para estado de la cola de descargas"""
+    stats["api_requests"] += 1
+    stats["last_api_request"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    auth_header = request.headers.get('Authorization')
+    if not verificar_autenticacion(auth_header):
+        return jsonify({"error": "No autorizado"}), 401
+    
+    # Obtener información de la cola
+    queue_info = {
+        "tareas_activas": list(download_queue_system.active_tasks.values()),
+        "cantidad_activas": len(download_queue_system.active_tasks),
+        "tamaño_cola": download_queue_system.priority_queue.qsize(),
+        "workers_activos": sum(1 for w in download_queue_system.workers if not w.done()),
+        "total_workers": download_queue_system.max_workers,
+        "tareas_procesadas": download_queue_system.task_counter
+    }
+    
+    # Obtener descargas activas
+    descargas_activas = []
+    for user_id, tracker in progress_trackers.items():
+        if tracker.is_active:
+            descargas_activas.append({
+                "user_id": user_id,
+                "chat_id": tracker.chat_id,
+                "progreso_descarga": tracker.download_progress,
+                "progreso_upload": tracker.upload_progress,
+                "ultima_actualizacion": tracker.last_update_time
+            })
+    
+    return jsonify({
+        "estado_cola": queue_info,
+        "descargas_activas": descargas_activas,
+        "jobs_pendientes": len(download_jobs)
+    })
+
+@api_app.route('/api/health', methods=['GET'])
+def api_health():
+    """Endpoint de verificación de salud del sistema"""
+    stats["api_requests"] += 1
+    
+    try:
+        # Verificar base de datos
+        conn = conectar_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        db_ok = cur.fetchone()[0] == 1
+        conn.close()
+        
+        # Verificar sistema de colas
+        queue_ok = download_queue_system.is_running
+        
+        # Verificar workers
+        workers_ok = len([w for w in download_queue_system.workers if not w.done()]) > 0
+        
+        return jsonify({
+            "status": "healthy" if all([db_ok, queue_ok, workers_ok]) else "degraded",
+            "checks": {
+                "database": db_ok,
+                "queue_system": queue_ok,
+                "workers": workers_ok,
+                "total_checks": 3,
+                "passed_checks": sum([db_ok, queue_ok, workers_ok])
+            },
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
+
+@api_app.route('/api/transactions', methods=['GET'])
+def api_transactions():
+    """Endpoint para ver transacciones recientes"""
+    stats["api_requests"] += 1
+    stats["last_api_request"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    auth_header = request.headers.get('Authorization')
+    if not verificar_autenticacion(auth_header):
+        return jsonify({"error": "No autorizado"}), 401
+    
+    conn = conectar_db()
+    cur = conn.cursor()
+    
+    limit = request.args.get('limit', 100, type=int)
+    
+    cur.execute("""
+        SELECT t.id, t.user_id, u.username, t.amount, t.type, t.description,
+               datetime(t.timestamp, 'unixepoch') as fecha
+        FROM transactions t
+        LEFT JOIN usuarios u ON t.user_id = u.id
+        ORDER BY t.timestamp DESC
+        LIMIT ?
+    """, (limit,))
+    
+    transacciones = []
+    for row in cur.fetchall():
+        transacciones.append({
+            "id": row[0],
+            "user_id": row[1],
+            "username": row[2] or f"User_{row[1]}",
+            "amount": row[3],
+            "type": row[4],
+            "description": row[5],
+            "fecha": row[6]
+        })
+    
+    conn.close()
+    
+    return jsonify({"transacciones": transacciones})
+
+@api_app.route('/api/withdrawals', methods=['GET'])
+def api_withdrawals():
+    """Endpoint para ver retiros"""
+    stats["api_requests"] += 1
+    stats["last_api_request"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    auth_header = request.headers.get('Authorization')
+    if not verificar_autenticacion(auth_header):
+        return jsonify({"error": "No autorizado"}), 401
+    
+    conn = conectar_db()
+    cur = conn.cursor()
+    
+    status = request.args.get('status', 'all')
+    limit = request.args.get('limit', 50, type=int)
+    
+    query = """
+        SELECT w.id, w.user_id, u.username, w.amount, w.address, 
+               w.status, datetime(w.timestamp, 'unixepoch') as fecha, w.tx_hash
+        FROM withdrawals w
+        LEFT JOIN usuarios u ON w.user_id = u.id
+    """
+    
+    params = []
+    if status != 'all':
+        query += " WHERE w.status = ?"
+        params.append(status)
+    
+    query += " ORDER BY w.timestamp DESC LIMIT ?"
+    params.append(limit)
+    
+    cur.execute(query, params)
+    
+    retiros = []
+    for row in cur.fetchall():
+        retiros.append({
+            "id": row[0],
+            "user_id": row[1],
+            "username": row[2] or f"User_{row[1]}",
+            "amount": row[3],
+            "address": row[4],
+            "status": row[5],
+            "fecha": row[6],
+            "tx_hash": row[7]
+        })
+    
+    conn.close()
+    
+    return jsonify({"retiros": retiros})
+
 def print_stats():
     os.system('cls' if os.name == 'nt' else 'clear')
     
@@ -393,6 +799,7 @@ def print_stats():
     print(f"💰 RECOMPENSAS: ${stats['total_rewards']:.2f}")
     print(f"💸 RETIROS: ${stats['total_withdrawals']:.2f}")
     print(f"👥 GANANCIAS POR REFERIDOS: ${stats['total_referral_earnings']:.2f}")
+    print(f"🌐 API REQUESTS: {stats['api_requests']}")
     print(f"⏱  TIEMPO ACTIVO: {int(hours)}h {int(minutes)}m {int(seconds)}s")
     print("=" * 50)
     
@@ -1905,12 +2312,22 @@ def start_background_tasks(application):
     loop.create_task(verificar_estado_sistema())
     loop.create_task(scheduled_tasks())
 
+def run_api():
+    """Función para ejecutar la API en un hilo separado"""
+    log_event(f"🌐 Iniciando API web en puerto {API_PORT}...")
+    api_app.run(host=API_HOST, port=API_PORT, debug=False, use_reloader=False)
+
 def main():
     crear_tabla()
     
     stats["start_time"] = time.time()
     print_stats()
-    log_event("🤖 Iniciando bot de descargas con sistema de colas mejorado...")
+    log_event("🤖 Iniciando bot de descargas con sistema de colas mejorado y API web...")
+    
+    # Iniciar la API en un hilo separado
+    api_thread = Thread(target=run_api, daemon=True)
+    api_thread.start()
+    log_event("✅ API web iniciada en segundo plano")
     
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
@@ -1924,7 +2341,12 @@ def main():
     
     start_background_tasks(application)
     
-    log_event("🚀 Bot en ejecución con NUEVO sistema de colas...")
+    log_event("🚀 Bot en ejecución con NUEVO sistema de colas y API web...")
+    log_event(f"📊 API disponible en: http://localhost:{API_PORT}")
+    log_event(f"📊 Endpoints principales:")
+    log_event(f"  • http://localhost:{API_PORT}/api/status")
+    log_event(f"  • http://localhost:{API_PORT}/api/stats")
+    log_event(f"  • http://localhost:{API_PORT}/api/health")
     
     try:
         application.run_polling()
