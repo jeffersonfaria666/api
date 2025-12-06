@@ -6,6 +6,7 @@ import requests
 import random
 import asyncio
 import re
+import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from yt_dlp import YoutubeDL
@@ -24,10 +25,10 @@ BSC_API_KEY = os.getenv('BSC_API_KEY', '9769MICJ2Z1PAEZVVZCX9HKYSIRWVYZA')
 LIMIT_POR_DIA = 100
 MIN_USDT = 4.99
 DB_NAME = "usuarios.db"
-MAX_WORKERS = 2  # Reducido para Render Free
-MAX_FRAGMENTS = 8  # Reducido para ahorrar recursos
-CHUNK_SIZE = 5 * 1024 * 1024  # Reducido
-MAX_FILE_SIZE = 500 * 1024 * 1024  # Reducido a 500MB para Telegram
+MAX_WORKERS = 2
+MAX_FRAGMENTS = 8
+CHUNK_SIZE = 5 * 1024 * 1024
+MAX_FILE_SIZE = 500 * 1024 * 1024
 
 # Parsear ADMIN_IDS desde variable de entorno
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
@@ -45,7 +46,7 @@ RECOMPENSAS_URL = "https://cryptorewards.page.gd/"
 
 # Límites
 MAX_TT_SIZE_NON_PREMIUM = 50 * 1024 * 1024
-YOUTUBE_DAILY_LIMIT = 3  # Reducido para usuarios gratuitos
+YOUTUBE_DAILY_LIMIT = 3
 MIN_WITHDRAWAL = 50
 
 # Almacenamiento temporal
@@ -54,7 +55,7 @@ executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 current_downloads = {}
 progress_trackers = {}
 
-# Sistema de colas simplificado para Render
+# Sistema de colas simplificado
 class DownloadQueueSystem:
     def __init__(self, max_workers=2):
         self.max_workers = max_workers
@@ -65,12 +66,25 @@ class DownloadQueueSystem:
         self.is_running = True
         self.app = None
         self.running_on_render = 'RENDER' in os.environ
+        self.aiohttp_session = None
+        
+    async def init_session(self):
+        """Inicializar sesión aiohttp"""
+        self.aiohttp_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=45)
+        )
+        
+    async def close_session(self):
+        """Cerrar sesión aiohttp"""
+        if self.aiohttp_session:
+            await self.aiohttp_session.close()
         
     def set_application(self, app):
         self.app = app
         
     async def start(self):
         """Inicia los workers de la cola"""
+        await self.init_session()
         for i in range(self.max_workers):
             worker = asyncio.create_task(self._worker(i))
             self.workers.append(worker)
@@ -82,6 +96,7 @@ class DownloadQueueSystem:
         for worker in self.workers:
             worker.cancel()
         await asyncio.gather(*self.workers, return_exceptions=True)
+        await self.close_session()
         
     async def add_task(self, priority, task_data):
         """Añade una tarea a la cola con prioridad"""
@@ -151,7 +166,7 @@ class DownloadQueueSystem:
             
             await progress_tracker.safe_edit_message(t['analyzing_size'])
             
-            # Analizar video
+            # Analizar video usando aiohttp para mayor eficiencia
             es_valido, tamano_estimado, titulo, duracion, calidad, formato = await analizar_video_con_detalles(url, user_id, tipo)
             
             if not es_valido:
@@ -171,7 +186,7 @@ class DownloadQueueSystem:
             
             # Descargar
             loop = asyncio.get_event_loop()
-            downloader = SafeParallelDownloader(url, user_id, tipo, progress_tracker)
+            downloader = SafeParallelDownloader(url, user_id, tipo, progress_tracker, self.aiohttp_session)
             downloader.estimated_size = tamano_estimado
             
             success = await loop.run_in_executor(executor, downloader.download)
@@ -230,7 +245,7 @@ class DownloadQueueSystem:
                 await progress_tracker.update_upload_progress(progress)
                 await asyncio.sleep(0.3)
             
-            timeout = 45  # Reducido para Render
+            timeout = 45
             
             if tipo.endswith("video"):
                 with open(filename, 'rb') as video_file:
@@ -279,7 +294,7 @@ stats = {
     "total_referral_earnings": 0.0
 }
 
-# Traducciones (mantenemos las mismas)
+# Traducciones
 translations = {
     "es": {
         "welcome": "🌟 ¡Bienvenido al Bot de Descargas más Potente! 🚀",
@@ -383,7 +398,7 @@ translations = {
     }
 }
 
-# Funciones auxiliares (mantener las mismas pero optimizadas)
+# Funciones auxiliares
 def print_stats():
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     elapsed_time = time.time() - stats["start_time"]
@@ -413,9 +428,7 @@ def log_event(event):
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {event}")
 
-# ... (mantener todas las funciones auxiliares del código original)
-# Solo necesitamos ajustar las que usan recursos intensivos
-
+# Database functions
 def conectar_db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -423,8 +436,53 @@ def conectar_db():
 
 def crear_tabla():
     conn = conectar_db()
-    # ... (mantener igual)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS usuarios (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        descargas_hoy INTEGER DEFAULT 0,
+        descargas_total INTEGER DEFAULT 0,
+        balance REAL DEFAULT 0.0,
+        premium INTEGER DEFAULT 0,
+        premium_expires TEXT,
+        referral_code TEXT UNIQUE,
+        referred_by INTEGER,
+        youtube_downloads INTEGER DEFAULT 0,
+        last_reset TEXT,
+        language TEXT DEFAULT 'es',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS transacciones (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        tx_hash TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS recompensas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        type TEXT,
+        referral_id INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
     conn.close()
+    log_event("✅ Base de datos inicializada")
 
 def es_url_valida(url):
     patterns = [
@@ -435,22 +493,254 @@ def es_url_valida(url):
     ]
     return any(re.match(pattern, url) for pattern in patterns)
 
-# ... (continuar con todas las funciones auxiliares)
+# Funciones de usuario
+def registrar_usuario(user_id, username, first_name, last_name):
+    conn = conectar_db()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT OR IGNORE INTO usuarios 
+    (user_id, username, first_name, last_name, referral_code, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, username, first_name, last_name, f"REF{user_id}", datetime.now().isoformat()))
+    
+    conn.commit()
+    conn.close()
 
-# Ajustar la función download del SafeParallelDownloader para usar menos recursos
+def get_usuario(user_id):
+    conn = conectar_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM usuarios WHERE user_id = ?', (user_id,))
+    usuario = cursor.fetchone()
+    conn.close()
+    return usuario
+
+def actualizar_estadisticas(user_id):
+    conn = conectar_db()
+    cursor = conn.cursor()
+    
+    usuario = get_usuario(user_id)
+    if usuario:
+        hoy = datetime.now().date().isoformat()
+        if usuario['last_reset'] != hoy:
+            cursor.execute('UPDATE usuarios SET descargas_hoy = 0, youtube_downloads = 0, last_reset = ? WHERE user_id = ?',
+                          (hoy, user_id))
+    
+    conn.commit()
+    conn.close()
+
+def es_premium(user_id):
+    usuario = get_usuario(user_id)
+    if not usuario:
+        return False
+    
+    if usuario['premium'] == 1:
+        if usuario['premium_expires']:
+            try:
+                expires = datetime.fromisoformat(usuario['premium_expires'])
+                return expires > datetime.now()
+            except:
+                return False
+        return True
+    return False
+
+def puede_descargar(user_id):
+    usuario = get_usuario(user_id)
+    if not usuario:
+        return True
+    
+    hoy = datetime.now().date().isoformat()
+    if usuario['last_reset'] != hoy:
+        return True
+    
+    if es_premium(user_id):
+        return True
+    
+    return usuario['descargas_hoy'] < LIMIT_POR_DIA
+
+def puede_descargar_youtube(user_id):
+    if es_premium(user_id):
+        return True
+    
+    usuario = get_usuario(user_id)
+    if not usuario:
+        return True
+    
+    hoy = datetime.now().date().isoformat()
+    if usuario['last_reset'] != hoy:
+        return True
+    
+    return usuario['youtube_downloads'] < YOUTUBE_DAILY_LIMIT
+
+def incrementar_descarga(user_id):
+    usuario = get_usuario(user_id)
+    if not usuario:
+        return 0
+    
+    conn = conectar_db()
+    cursor = conn.cursor()
+    
+    hoy = datetime.now().date().isoformat()
+    if usuario['last_reset'] != hoy:
+        cursor.execute('UPDATE usuarios SET descargas_hoy = 1, descargas_total = descargas_total + 1, last_reset = ? WHERE user_id = ?',
+                      (hoy, user_id))
+    else:
+        cursor.execute('UPDATE usuarios SET descargas_hoy = descargas_hoy + 1, descargas_total = descargas_total + 1 WHERE user_id = ?',
+                      (user_id,))
+    
+    # Asignar recompensa aleatoria
+    recompensa = round(random.uniform(REWARD_PER_DOWNLOAD_MIN, REWARD_PER_DOWNLOAD_MAX), 2)
+    cursor.execute('UPDATE usuarios SET balance = balance + ? WHERE user_id = ?',
+                  (recompensa, user_id))
+    
+    # Registrar recompensa
+    cursor.execute('INSERT INTO recompensas (user_id, amount, type) VALUES (?, ?, ?)',
+                  (user_id, recompensa, 'download'))
+    
+    conn.commit()
+    conn.close()
+    
+    stats["total_downloads"] += 1
+    stats["daily_downloads"] += 1
+    stats["total_rewards"] += recompensa
+    
+    return recompensa
+
+def incrementar_descarga_youtube(user_id):
+    conn = conectar_db()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE usuarios SET youtube_downloads = youtube_downloads + 1 WHERE user_id = ?',
+                  (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_user_language(user_id):
+    usuario = get_usuario(user_id)
+    return usuario['language'] if usuario and usuario['language'] else 'es'
+
+# Funciones de descarga
+async def analizar_video_con_detalles(url, user_id, tipo):
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'forcejson': True,
+            'socket_timeout': 30,
+            'extract_flat': False
+        }
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            titulo = info.get('title', 'Video')
+            duracion = info.get('duration', 0)
+            
+            # Determinar tamaño estimado
+            tamano_estimado = 0
+            calidad = "Desconocida"
+            formato = "Desconocido"
+            
+            if 'formats' in info:
+                for f in info['formats']:
+                    if f.get('filesize'):
+                        tamano_estimado = max(tamano_estimado, f['filesize'])
+                        if f.get('height'):
+                            calidad = f"{f['height']}p"
+                        if f.get('ext'):
+                            formato = f['ext']
+            
+            # Si no hay tamaño en los formatos, estimar
+            if tamano_estimado == 0 and duracion > 0:
+                # Estimación aproximada: 1 minuto ≈ 10MB para 720p
+                tamano_estimado = (duracion / 60) * 10 * 1024 * 1024
+            
+            # Verificar límites para usuarios no premium
+            if tipo.startswith("tt_") and not es_premium(user_id):
+                if tamano_estimado > MAX_TT_SIZE_NON_PREMIUM:
+                    return False, tamano_estimado, titulo, duracion, calidad, formato
+            
+            return True, tamano_estimado, titulo, duracion, calidad, formato
+            
+    except Exception as e:
+        log_event(f"❌ Error analizando video: {e}")
+        return False, 0, "", 0, "", ""
+
+def format_duration(seconds):
+    if seconds <= 0:
+        return "0:00"
+    
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes}:{secs:02d}"
+
+def sanitize_filename(filename):
+    # Remover caracteres no válidos para nombres de archivo
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    
+    # Limitar longitud
+    if len(filename) > 100:
+        name, ext = os.path.splitext(filename)
+        filename = name[:100 - len(ext)] + ext
+    
+    return filename
+
+# Clase para seguimiento de progreso
+class SafeProgressTracker:
+    def __init__(self, chat_id, message_id, user_id, app):
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.user_id = user_id
+        self.app = app
+        self.last_update = time.time()
+        self.update_interval = 2.0  # Segundos entre actualizaciones
+        
+    async def safe_edit_message(self, text, parse_mode='Markdown'):
+        try:
+            current_time = time.time()
+            if current_time - self.last_update < self.update_interval:
+                return
+                
+            await self.app.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+                text=text,
+                parse_mode=parse_mode
+            )
+            self.last_update = current_time
+        except Exception as e:
+            log_event(f"⚠️ Error editando mensaje: {e}")
+    
+    async def update_download_progress(self, progress):
+        lang = get_user_language(self.user_id)
+        t = translations[lang]
+        await self.safe_edit_message(t['downloading'].format(progress))
+    
+    async def update_upload_progress(self, progress):
+        lang = get_user_language(self.user_id)
+        t = translations[lang]
+        await self.safe_edit_message(t['uploading'].format(progress))
+
+# Clase mejorada para descargas paralelas
 class SafeParallelDownloader:
-    def __init__(self, url, user_id, tipo, progress_tracker):
+    def __init__(self, url, user_id, tipo, progress_tracker, aiohttp_session=None):
         self.url = url
         self.user_id = user_id
         self.tipo = tipo
         self.filename = None
         self.video_title = None
         self.estimated_size = 0
-        self.priority = 0 if es_premium(user_id) else 1
-        self.timestamp = int(time.time())
-        self.prefix = "download"
-        self.base_filename = f"{self.prefix}_{user_id}_{self.timestamp}"
         self.progress_tracker = progress_tracker
+        self.aiohttp_session = aiohttp_session
+        self.prefix = "download"
+        self.base_filename = f"{self.prefix}_{user_id}_{int(time.time())}"
         
     def get_video_info(self):
         try:
@@ -480,14 +770,7 @@ class SafeParallelDownloader:
                 return False
                 
             ydl_opts = self._get_ydl_options()
-            
             ydl_opts['progress_hooks'] = [self._progress_hook]
-            
-            # Configuración optimizada para Render
-            ydl_opts['socket_timeout'] = 45
-            ydl_opts['retries'] = 2
-            ydl_opts['fragment_retries'] = 2
-            ydl_opts['extract_flat'] = False
             
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([self.url])
@@ -529,11 +812,14 @@ class SafeParallelDownloader:
             downloaded = d.get('downloaded_bytes', 0)
             if total and downloaded:
                 progress = int((downloaded / total) * 100)
-                if progress % 10 == 0:  # Actualizar cada 10% para reducir carga
+                if progress % 10 == 0:  # Actualizar cada 10%
                     try:
-                        asyncio.run(self.progress_tracker.update_download_progress(progress))
-                    except RuntimeError:
-                        pass  # Ignorar si el event loop está cerrado
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.progress_tracker.update_download_progress(progress))
+                        loop.close()
+                    except:
+                        pass
         
     def _get_ydl_options(self):
         base_opts = {
@@ -542,14 +828,14 @@ class SafeParallelDownloader:
             'socket_timeout': 45,
             'retries': 2,
             'fragment_retries': 2,
-            'concurrent_fragment_downloads': 4,  # Reducido para Render
-            'http_chunk_size': 2 * 1024 * 1024,  # Reducido
+            'concurrent_fragment_downloads': 4,
+            'http_chunk_size': 2 * 1024 * 1024,
             'abort_on_unavailable_fragment': True,
             'quiet': True,
         }
         
         if self.tipo == "tt_video":
-            return {**base_opts, 'format': 'best[filesize<50000000]'}  # Limitado a 50MB
+            return {**base_opts, 'format': 'best[filesize<50000000]'}
         elif self.tipo == "tt_audio":
             return {
                 **base_opts,
@@ -563,21 +849,388 @@ class SafeParallelDownloader:
                 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
             }
         elif self.tipo == "yt_video":
-            return {**base_opts, 'format': 'best[filesize<100000000]'}  # Limitado a 100MB
+            return {**base_opts, 'format': 'best[filesize<100000000]'}
         else:
             return {**base_opts, 'format': 'best[filesize<50000000]'}
 
-# Mantener todas las demás funciones iguales...
+# Funciones del bot
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    last_name = update.effective_user.last_name
+    
+    registrar_usuario(user_id, username, first_name, last_name)
+    
+    lang = get_user_language(user_id)
+    t = translations[lang]
+    
+    keyboard = [
+        [InlineKeyboardButton(t['download_content'], callback_data='download_content')],
+        [InlineKeyboardButton(t['premium'], callback_data='premium'),
+         InlineKeyboardButton(t['referrals'], callback_data='referrals')],
+        [InlineKeyboardButton(t['stats'], callback_data='stats'),
+         InlineKeyboardButton(t['support'], callback_data='support')],
+        [InlineKeyboardButton(t['withdraw'], callback_data='withdraw'),
+         InlineKeyboardButton(t['language'], callback_data='language')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"{t['welcome']}\n\n{t['download_options']}\n\n{t['select_option']}",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-# Función main optimizada
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Solo administradores pueden usar este comando.")
+        return
+    
+    print_stats()
+    
+    stats_text = f"""
+📊 **ESTADÍSTICAS DEL BOT**
+━━━━━━━━━━━━━━━━
+• Total descargas: {stats['total_downloads']}
+• Descargas hoy: {stats['daily_downloads']}
+• Usuarios únicos: {len(stats['unique_users'])}
+• Usuarios premium: {stats['premium_users']}
+• Descargas activas: {stats['active_downloads']}
+• En cola: {stats['queue_size']}
+• Errores: {stats['errors']}
+• Total recompensas: ${stats['total_rewards']:.2f}
+• Total retiros: ${stats['total_withdrawals']:.2f}
+━━━━━━━━━━━━━━━━
+"""
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    usuario = get_usuario(user_id)
+    
+    if not usuario:
+        await update.message.reply_text("❌ Primero debes usar /start")
+        return
+    
+    lang = get_user_language(user_id)
+    t = translations[lang]
+    
+    if usuario['balance'] < MIN_WITHDRAWAL:
+        await update.message.reply_text(
+            t['withdraw_minimum'].format(MIN_WITHDRAWAL) + f"\n\n💰 Tu balance actual: ${usuario['balance']:.2f} USDT"
+        )
+        return
+    
+    await update.message.reply_text(
+        f"💰 **RETIRO DE FONDOS**\n\n"
+        f"• Balance disponible: ${usuario['balance']:.2f} USDT\n"
+        f"• Mínimo para retirar: ${MIN_WITHDRAWAL} USDT\n\n"
+        f"⚠️ Por favor, envía la dirección de tu wallet BSC (BEP-20) donde deseas recibir los USDT."
+    )
+
+async def procesar_descarga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    url = update.message.text.strip()
+    
+    if not es_url_valida(url):
+        await update.message.reply_text("❌ URL no válida. Envía un enlace de TikTok o YouTube.")
+        return
+    
+    lang = get_user_language(user_id)
+    t = translations[lang]
+    
+    # Verificar si puede descargar
+    if not puede_descargar(user_id):
+        await update.message.reply_text(
+            t['limit_reached'] + "\n\n" + t['limit_message'].format(LIMIT_POR_DIA) +
+            "\n\n💎 /premium - Para descargas ilimitadas"
+        )
+        return
+    
+    # Determinar tipo de descarga
+    if "tiktok.com" in url or "vm.tiktok.com" in url:
+        tipo_options = [
+            [InlineKeyboardButton("🎬 Video TikTok", callback_data=f"tt_video:{url}")],
+            [InlineKeyboardButton("🎵 Audio TikTok (MP3)", callback_data=f"tt_audio:{url}")]
+        ]
+    elif "youtube.com" in url or "youtu.be" in url:
+        if es_premium(user_id):
+            tipo_options = [
+                [InlineKeyboardButton("🎬 Video YouTube", callback_data=f"yt_video:{url}")],
+                [InlineKeyboardButton("🎵 Audio YouTube (MP3)", callback_data=f"yt_audio:{url}")]
+            ]
+        else:
+            await update.message.reply_text(t['youtube_audio_only'])
+            tipo_options = [
+                [InlineKeyboardButton("🎵 Audio YouTube (MP3)", callback_data=f"yt_audio:{url}")]
+            ]
+    else:
+        await update.message.reply_text("❌ Plataforma no soportada. Solo TikTok y YouTube.")
+        return
+    
+    reply_markup = InlineKeyboardMarkup(tipo_options)
+    await update.message.reply_text("🎬 **Selecciona el tipo de descarga:**", reply_markup=reply_markup)
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    callback_data = query.data
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+    
+    lang = get_user_language(user_id)
+    t = translations[lang]
+    
+    if callback_data == 'download_content':
+        await query.edit_message_text(
+            "🎬 **Descargar Contenido**\n\n"
+            "Envía el enlace del video que quieres descargar:\n"
+            "• TikTok: https://tiktok.com/...\n"
+            "• YouTube: https://youtube.com/...\n\n"
+            "⚠️ Límite de 50MB para usuarios gratuitos"
+        )
+    
+    elif callback_data == 'premium':
+        keyboard = [
+            [InlineKeyboardButton("💎 Comprar Premium", callback_data='buy_premium')],
+            [InlineKeyboardButton("🔙 Volver", callback_data='menu_principal')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "💎 **PREMIUM VIP**\n\n"
+            "✨ **Beneficios exclusivos:**\n"
+            "• ✅ Descargas ILIMITADAS todos los días\n"
+            "• ✅ Videos de cualquier tamaño (sin límite de 50MB)\n"
+            "• ✅ Descargas de YouTube en video (no solo audio)\n"
+            "• ✅ Prioridad en la cola de descargas\n"
+            "• ✅ Sin anuncios ni restricciones\n\n"
+            "💰 **Precio:** $4.99 USDT (pago único, vida útil)\n\n"
+            "🔗 **Red:** BSC (BEP-20)\n"
+            f"📍 **Wallet:** `{USDT_ADDRESS}`\n\n"
+            "⚠️ Después de pagar, envía el hash de la transacción para activar tu premium.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    
+    elif callback_data.startswith(('tt_', 'yt_')):
+        tipo, url = callback_data.split(':', 1)
+        
+        # Verificar límites
+        if not puede_descargar(user_id):
+            await query.edit_message_text(t['limit_reached'])
+            return
+        
+        # Verificar límites de YouTube para usuarios gratuitos
+        if tipo.startswith('yt_') and tipo.endswith('video') and not es_premium(user_id):
+            await query.edit_message_text(t['youtube_premium_only'])
+            return
+        
+        # Mostrar mensaje de procesamiento
+        usuario = get_usuario(user_id)
+        priority = 0 if es_premium(user_id) else 1
+        
+        if priority == 0:
+            queue_msg = t['premium_priority']
+        else:
+            queue_position = download_queue_system.priority_queue.qsize() + 1
+            queue_msg = t['queue_position'].format(queue_position)
+        
+        await query.edit_message_text(
+            f"⏳ **Procesando tu solicitud...**\n\n"
+            f"{queue_msg}\n\n"
+            f"📊 Descargas disponibles hoy: {LIMIT_POR_DIA - usuario['descargas_hoy']}/{LIMIT_POR_DIA}\n"
+            f"💰 Balance actual: ${usuario['balance']:.2f} USDT"
+        )
+        
+        # Añadir a la cola
+        job_id = await download_queue_system.add_task(priority, (f"job_{user_id}_{int(time.time())}", user_id, url, tipo, chat_id, message_id))
+        
+    elif callback_data == 'stats':
+        usuario = get_usuario(user_id)
+        hoy = datetime.now().date().isoformat()
+        
+        if usuario['last_reset'] != hoy:
+            descargas_hoy = 0
+            youtube_hoy = 0
+        else:
+            descargas_hoy = usuario['descargas_hoy']
+            youtube_hoy = usuario['youtube_downloads']
+        
+        stats_text = f"""
+📊 **TUS ESTADÍSTICAS**
+━━━━━━━━━━━━━━━━
+👤 Usuario: @{usuario['username'] or usuario['first_name']}
+💰 Balance: ${usuario['balance']:.2f} USDT
+💎 Premium: {'✅' if es_premium(user_id) else '❌'}
+━━━━━━━━━━━━━━━━
+⬇️ Descargas hoy: {descargas_hoy}/{LIMIT_POR_DIA}
+🎵 YouTube hoy: {youtube_hoy}/{YOUTUBE_DAILY_LIMIT}
+📈 Total descargas: {usuario['descargas_total']}
+━━━━━━━━━━━━━━━━
+"""
+        keyboard = [
+            [InlineKeyboardButton(t['menu_principal'], callback_data='menu_principal')],
+            [InlineKeyboardButton("🎁 Reclamar Recompensas", url=RECOMPENSAS_URL)]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(stats_text, reply_markup=reply_markup)
+    
+    elif callback_data == 'referrals':
+        usuario = get_usuario(user_id)
+        referral_code = usuario['referral_code'] or f"REF{user_id}"
+        referral_link = f"https://t.me/{(await context.bot.get_me()).username}?start={referral_code}"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔗 Copiar enlace de referido", callback_data='copy_referral')],
+            [InlineKeyboardButton("👥 Ver referidos", callback_data='view_referrals')],
+            [InlineKeyboardButton(t['menu_principal'], callback_data='menu_principal')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"👥 **PROGRAMA DE REFERIDOS**\n\n"
+            f"💰 **Gana ${REFERRAL_REWARD} USDT por cada amigo que invites!**\n\n"
+            f"🔗 **Tu enlace único:**\n`{referral_link}`\n\n"
+            f"**Cómo funciona:**\n"
+            f"1. Comparte tu enlace con amigos\n"
+            f"2. Cuando usen tu enlace y descarguen su primer video\n"
+            f"3. ¡Recibes ${REFERRAL_REWARD} USDT en tu balance!\n\n"
+            f"⚠️ El referido también recibe ${REFERRAL_REWARD/2:.2f} USDT de bonificación.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    
+    elif callback_data == 'support':
+        keyboard = [
+            [InlineKeyboardButton(t['community'], url=COMUNIDAD_URL)],
+            [InlineKeyboardButton(t['donate'], url=DONACION_URL)],
+            [InlineKeyboardButton(t['menu_principal'], callback_data='menu_principal')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "🆘 **SOPORTE TÉCNICO**\n\n"
+            "¿Tienes problemas con el bot?\n\n"
+            "**Soluciones rápidas:**\n"
+            "• Si no descarga: Verifica que el enlace sea público\n"
+            "• Si es muy lento: Puede ser por alta demanda\n"
+            "• Si no envía: El archivo puede ser muy grande (>500MB)\n\n"
+            "**Para más ayuda:**",
+            reply_markup=reply_markup
+        )
+    
+    elif callback_data == 'withdraw':
+        await withdraw_command(update, context)
+    
+    elif callback_data == 'language':
+        keyboard = [
+            [InlineKeyboardButton("🇪🇸 Español", callback_data='set_lang_es')],
+            [InlineKeyboardButton("🇺🇸 English", callback_data='set_lang_en')],
+            [InlineKeyboardButton(t['back'], callback_data='menu_principal')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "🌐 **IDIOMA / LANGUAGE**\n\n"
+            "Selecciona tu idioma preferido:",
+            reply_markup=reply_markup
+        )
+    
+    elif callback_data.startswith('set_lang_'):
+        lang_code = callback_data.split('_')[-1]
+        
+        conn = conectar_db()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE usuarios SET language = ? WHERE user_id = ?', (lang_code, user_id))
+        conn.commit()
+        conn.close()
+        
+        t = translations[lang_code]
+        await callback_handler(update, context)  # Recargar menú principal con nuevo idioma
+    
+    elif callback_data == 'menu_principal':
+        keyboard = [
+            [InlineKeyboardButton(t['download_content'], callback_data='download_content')],
+            [InlineKeyboardButton(t['premium'], callback_data='premium'),
+             InlineKeyboardButton(t['referrals'], callback_data='referrals')],
+            [InlineKeyboardButton(t['stats'], callback_data='stats'),
+             InlineKeyboardButton(t['support'], callback_data='support')],
+            [InlineKeyboardButton(t['withdraw'], callback_data='withdraw'),
+             InlineKeyboardButton(t['language'], callback_data='language')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"{t['welcome']}\n\n{t['download_options']}\n\n{t['select_option']}",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_event(f"❌ Error: {context.error}")
+    stats["errors"] += 1
+    
+    try:
+        if update and update.effective_user:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="❌ Ocurrió un error. Por favor, intenta de nuevo más tarde."
+            )
+    except:
+        pass
+
+async def mostrar_menu_post_descarga(app, chat_id, message_id, recompensa):
+    try:
+        user_id = chat_id
+        lang = get_user_language(user_id)
+        t = translations[lang]
+        
+        usuario = get_usuario(user_id)
+        
+        keyboard = [
+            [InlineKeyboardButton("⬇️ Descargar otro video", callback_data='download_content')],
+            [InlineKeyboardButton("📊 Ver estadísticas", callback_data='stats'),
+             InlineKeyboardButton("💎 Premium", callback_data='premium')],
+            [InlineKeyboardButton("👥 Invitar amigos", callback_data='referrals'),
+             InlineKeyboardButton("🏠 Menú principal", callback_data='menu_principal')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await app.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"✅ **¡Descarga completada!**\n\n"
+                 f"💰 Has ganado **${recompensa:.2f} USDT** por esta descarga.\n\n"
+                 f"📊 **Resumen:**\n"
+                 f"• Descargas hoy: {usuario['descargas_hoy']}/{LIMIT_POR_DIA}\n"
+                 f"• Balance total: ${usuario['balance']:.2f} USDT\n\n"
+                 f"¿Qué quieres hacer ahora?",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        log_event(f"❌ Error mostrando menú post-descarga: {e}")
+
+async def start_background_tasks(application):
+    """Iniciar tareas en segundo plano"""
+    download_queue_system.set_application(application)
+    await download_queue_system.start()
+    log_event("✅ Tareas en segundo plano iniciadas")
+
 def main():
     crear_tabla()
     
     stats["start_time"] = time.time()
     print_stats()
-    log_event("🤖 Iniciando bot de descargas en Render...")
+    log_event("🤖 Iniciando bot de descargas...")
     
-    # Verificar variables de entorno
     if not BOT_TOKEN:
         log_event("❌ ERROR: BOT_TOKEN no configurado")
         sys.exit(1)
@@ -593,10 +1246,11 @@ def main():
     
     application.add_error_handler(error_handler)
     
-    # Iniciar sistema de colas
-    start_background_tasks(application)
+    # Iniciar sistema de colas en segundo plano
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_background_tasks(application))
     
-    log_event("🚀 Bot en ejecución en Render...")
+    log_event("🚀 Bot en ejecución...")
     
     try:
         application.run_polling()
@@ -606,6 +1260,7 @@ def main():
         log_event(f"❌ Error crítico: {e}")
     finally:
         executor.shutdown(wait=False)
+        loop.run_until_complete(download_queue_system.stop())
 
 if __name__ == "__main__":
     main()
