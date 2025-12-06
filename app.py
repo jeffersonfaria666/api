@@ -19,9 +19,9 @@ import json
 import signal
 
 # Configuración
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7239423213:AAE6lmCeiuz9_GoeujWDYo64B0FOfcHoFFA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 USDT_ADDRESS = "0x594EAB95D5683851E0eBFfC457C07dc217Bf4830".lower()
-BSC_API_KEY = os.environ.get("BSC_API_KEY", "9769MICJ2Z1PAEZVVZCX9HKYSIRWVYZA")
+BSC_API_KEY = os.environ.get("BSC_API_KEY", "")
 LIMIT_POR_DIA = 100
 MIN_USDT = 4.99
 DB_NAME = "usuarios.db"
@@ -2372,3 +2372,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
