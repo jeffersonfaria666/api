@@ -1,11 +1,16 @@
 services:
-  - type: web
-    name: youtube-downloader
+  - type: worker
+    name: telegram-download-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.0
     plan: free
-    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BSC_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: PORT
+        value: 8080
