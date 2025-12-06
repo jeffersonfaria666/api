@@ -1,885 +1,611 @@
-#!/usr/bin/env python3
-"""
-🚀 SERVIDOR YOUTUBE - VERSIÓN SIN COOKIES CON RATE LIMITING
-Versión: 10.0 - Manejo de errores 429 y cookies expiradas
-"""
-
 import os
 import sys
-import json
-import logging
-import tempfile
-import shutil
 import time
-import subprocess
+import sqlite3
+import requests
 import random
-import threading
+import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List
-from collections import defaultdict
-from urllib.parse import urlparse
+from yt_dlp import YoutubeDL
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters
+from telegram.error import BadRequest, RetryAfter
+from dotenv import load_dotenv
 
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import yt_dlp
+# Cargar variables de entorno
+load_dotenv()
 
-# ==============================
-# CONFIGURACIÓN
-# ==============================
-class Config:
-    PORT = int(os.environ.get('PORT', 10000))
-    HOST = '0.0.0.0'
-    MAX_FILE_SIZE = 200 * 1024 * 1024
-    COOKIES_FILE = 'cookies.txt'
-    
-    # Rate limiting
-    REQUESTS_PER_MINUTE = 30  # Límite conservador para evitar 429
-    ENABLE_RATE_LIMITING = True
-    
-    # User Agents
-    USER_AGENTS = [
-        # Chrome en Windows
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-        
-        # Firefox
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
-        
-        # Safari
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        
-        # Edge
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-        
-        # Mobile
-        'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    ]
-    
-    # Proxies (opcional, dejar vacío si no se usan)
-    PROXIES = []  # Ejemplo: ['http://proxy1:port', 'http://proxy2:port']
-    
-    # Retry configuration
-    MAX_RETRIES = 3
-    RETRY_DELAY = 2  # segundos entre reintentos
-    
-    # Timeouts
-    SOCKET_TIMEOUT = 45
-    CONNECT_TIMEOUT = 30
+# Configuración
+BOT_TOKEN = os.getenv('BOT_TOKEN', '7239423213:AAE6lmCeiuz9_GoeujWDYo64B0FOfcHoFFA')
+USDT_ADDRESS = "0x594EAB95D5683851E0eBFfC457C07dc217Bf4830".lower()
+BSC_API_KEY = os.getenv('BSC_API_KEY', '9769MICJ2Z1PAEZVVZCX9HKYSIRWVYZA')
+LIMIT_POR_DIA = 100
+MIN_USDT = 4.99
+DB_NAME = "usuarios.db"
+MAX_WORKERS = 2  # Reducido para Render Free
+MAX_FRAGMENTS = 8  # Reducido para ahorrar recursos
+CHUNK_SIZE = 5 * 1024 * 1024  # Reducido
+MAX_FILE_SIZE = 500 * 1024 * 1024  # Reducido a 500MB para Telegram
 
-# ==============================
-# RATE LIMITER
-# ==============================
-class RateLimiter:
-    """Simple rate limiter para evitar error 429"""
-    def __init__(self, requests_per_minute: int = 30):
-        self.requests_per_minute = requests_per_minute
-        self.request_times = []
-        self.lock = threading.Lock()
-    
-    def wait_if_needed(self):
-        """Espera si se ha excedido el límite de requests"""
-        if not Config.ENABLE_RATE_LIMITING:
-            return
-        
-        with self.lock:
-            now = time.time()
-            
-            # Limpiar requests más viejos de 1 minuto
-            cutoff_time = now - 60
-            self.request_times = [t for t in self.request_times if t > cutoff_time]
-            
-            # Si estamos cerca del límite, esperar
-            if len(self.request_times) >= self.requests_per_minute:
-                oldest_time = self.request_times[0]
-                wait_time = 60 - (now - oldest_time)
-                if wait_time > 0:
-                    logger.info(f"⏳ Rate limiting: esperando {wait_time:.1f}s")
-                    time.sleep(wait_time)
-                    # Actualizar lista después de esperar
-                    now = time.time()
-                    cutoff_time = now - 60
-                    self.request_times = [t for t in self.request_times if t > cutoff_time]
-            
-            # Agregar este request
-            self.request_times.append(now)
-    
-    def get_status(self):
-        """Obtener estado actual del rate limiter"""
-        with self.lock:
-            now = time.time()
-            cutoff_time = now - 60
-            recent_requests = [t for t in self.request_times if t > cutoff_time]
-            return {
-                'recent_requests': len(recent_requests),
-                'limit_per_minute': self.requests_per_minute,
-                'available': self.requests_per_minute - len(recent_requests),
-                'oldest_request': min(recent_requests) if recent_requests else None
-            }
+# Parsear ADMIN_IDS desde variable de entorno
+ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
+ADMIN_IDS = [int(id.strip()) for id in ADMIN_IDS_STR.split(',') if id.strip().isdigit()]
 
-# ==============================
-# SETUP DE LOGGING
-# ==============================
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)]
-    )
-    logging.getLogger('werkzeug').setLevel(logging.WARNING)
-    logging.getLogger('yt_dlp').setLevel(logging.ERROR)  # Reducir logs de yt-dlp
-    return logging.getLogger(__name__)
+# Sistema de recompensas
+REWARD_PER_DOWNLOAD_MIN = 0.01
+REWARD_PER_DOWNLOAD_MAX = 0.50
+REFERRAL_REWARD = 5.00
 
-logger = setup_logging()
+# URLs
+COMUNIDAD_URL = "https://t.me/descargar_videos_de_tiktok"
+DONACION_URL = "https://www.paypal.com/paypalme/JeffersonFaria525"
+RECOMPENSAS_URL = "https://cryptorewards.page.gd/"
 
-# ==============================
-# INSTANCIAS GLOBALES
-# ==============================
-rate_limiter = RateLimiter(Config.REQUESTS_PER_MINUTE)
+# Límites
+MAX_TT_SIZE_NON_PREMIUM = 50 * 1024 * 1024
+YOUTUBE_DAILY_LIMIT = 3  # Reducido para usuarios gratuitos
+MIN_WITHDRAWAL = 50
 
-# ==============================
-# UTILIDADES
-# ==============================
-def get_random_user_agent():
-    return random.choice(Config.USER_AGENTS)
+# Almacenamiento temporal
+download_jobs = {}
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+current_downloads = {}
+progress_trackers = {}
 
-def get_proxy():
-    """Obtener proxy aleatorio si están configurados"""
-    if Config.PROXIES:
-        return random.choice(Config.PROXIES)
-    return None
-
-def is_cookies_valid():
-    """Verificar si las cookies son válidas (básico)"""
-    if not os.path.exists(Config.COOKIES_FILE):
-        return False
-    
-    try:
-        size = os.path.getsize(Config.COOKIES_FILE)
-        if size < 100:
-            return False
+# Sistema de colas simplificado para Render
+class DownloadQueueSystem:
+    def __init__(self, max_workers=2):
+        self.max_workers = max_workers
+        self.priority_queue = asyncio.Queue()
+        self.active_tasks = {}
+        self.task_counter = 0
+        self.workers = []
+        self.is_running = True
+        self.app = None
+        self.running_on_render = 'RENDER' in os.environ
         
-        # Verificar si tienen formato Netscape
-        with open(Config.COOKIES_FILE, 'r', encoding='utf-8') as f:
-            first_line = f.readline().strip()
-            if 'Netscape HTTP Cookie File' not in first_line:
-                return False
+    def set_application(self, app):
+        self.app = app
         
-        # Verificar si tienen cookies de YouTube
-        with open(Config.COOKIES_FILE, 'r', encoding='utf-8') as f:
-            content = f.read()
-            if '.youtube.com' not in content:
-                return False
+    async def start(self):
+        """Inicia los workers de la cola"""
+        for i in range(self.max_workers):
+            worker = asyncio.create_task(self._worker(i))
+            self.workers.append(worker)
+        log_event(f"🚀 Sistema de colas iniciado con {self.max_workers} workers")
         
-        return True
-    except:
-        return False
-
-def should_use_cookies():
-    """Decide si usar cookies basado en su validez y estado actual"""
-    if not is_cookies_valid():
-        logger.info("⚠️  Cookies inválidas o expiradas, operando sin cookies")
-        return False
-    
-    # Las cookies pueden ser válidas pero causar problemas
-    # Por ahora, mejor no usarlas si hemos tenido problemas
-    return False  # Forzar sin cookies por ahora
-
-# ==============================
-# CLASE PRINCIPAL
-# ==============================
-class YouTubeDownloader:
-    def __init__(self, use_cookies: bool = None):
-        self.temp_dir = None
-        self.output_path = None
+    async def stop(self):
+        """Detiene todos los workers"""
+        self.is_running = False
+        for worker in self.workers:
+            worker.cancel()
+        await asyncio.gather(*self.workers, return_exceptions=True)
         
-        # Decidir si usar cookies
-        if use_cookies is None:
-            self.use_cookies = should_use_cookies()
-        else:
-            self.use_cookies = use_cookies
+    async def add_task(self, priority, task_data):
+        """Añade una tarea a la cola con prioridad"""
+        self.task_counter += 1
+        task_id = self.task_counter
+        await self.priority_queue.put((priority, task_id, task_data))
+        return task_id
         
-        logger.info(f"📡 Modo: {'CON cookies' if self.use_cookies else 'SIN cookies'}")
-    
-    def _get_base_options(self, attempt: int = 0):
-        """Opciones base optimizadas para evitar 429"""
+    async def _worker(self, worker_id):
+        """Worker que procesa tareas de la cola"""
+        log_event(f"👷 Worker {worker_id} iniciado")
         
-        # Aplicar rate limiting
-        rate_limiter.wait_if_needed()
-        
-        # User Agent específico para este intento
-        user_agent = get_random_user_agent()
-        
-        base_opts = {
-            'quiet': True,
-            'no_warnings': attempt > 0,  # Solo warnings en primer intento
-            'ignoreerrors': True,
-            'no_color': True,
-            'noprogress': True,
-            'socket_timeout': Config.SOCKET_TIMEOUT,
-            'connect_timeout': Config.CONNECT_TIMEOUT,
-            'retries': 10,
-            'fragment_retries': 10,
-            'skip_unavailable_fragments': True,
-            'noplaylist': True,
-            'extract_flat': False,
-            'ignore_no_formats_error': True,
-            'throttled_rate': '1M',  # Limitar velocidad de descarga
-            
-            # Headers para parecer navegador real
-            'http_headers': {
-                'User-Agent': user_agent,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-                'Cache-Control': 'max-age=0',
-                'DNT': '1',
-            },
-            
-            # Configuración específica de YouTube
-            'youtube_include_dash_manifest': False,
-            'youtube_include_hls_manifest': False,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                    'player_skip': ['configs'],
-                    'skip': ['hls', 'dash'],
-                }
-            },
-        }
-        
-        # Añadir cookies si se deben usar
-        if self.use_cookies and is_cookies_valid():
-            base_opts['cookiefile'] = Config.COOKIES_FILE
-            logger.debug("Usando cookies del archivo")
-        
-        # Añadir proxy si está configurado (solo en reintentos)
-        if attempt > 0 and Config.PROXIES:
-            proxy = get_proxy()
-            if proxy:
-                base_opts['proxy'] = proxy
-                logger.info(f"Usando proxy: {proxy}")
-        
-        # En reintentos, cambiar estrategia
-        if attempt > 0:
-            # Cambiar User Agent
-            base_opts['http_headers']['User-Agent'] = get_random_user_agent()
-            
-            # Aumentar timeouts
-            base_opts['socket_timeout'] = Config.SOCKET_TIMEOUT + (attempt * 10)
-            base_opts['connect_timeout'] = Config.CONNECT_TIMEOUT + (attempt * 5)
-            
-            # Forzar modo simple en último intento
-            if attempt >= 2:
-                base_opts['extract_flat'] = True
-                if 'cookiefile' in base_opts:
-                    del base_opts['cookiefile']
-        
-        return base_opts
-    
-    def get_info(self, url: str) -> Dict[str, Any]:
-        """Obtiene información del video con manejo robusto de errores"""
-        last_error = None
-        
-        for attempt in range(Config.MAX_RETRIES):
+        while self.is_running:
             try:
-                logger.info(f"📊 Obteniendo info (intento {attempt + 1}) para: {url[:50]}...")
+                try:
+                    priority, task_id, task_data = await asyncio.wait_for(
+                        self.priority_queue.get(), timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                    
+                job_id, user_id, url, tipo, chat_id, message_id = task_data
                 
-                ydl_opts = self._get_base_options(attempt)
-                ydl_opts['skip_download'] = True
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    
-                    if not info:
-                        return {
-                            'success': False, 
-                            'error': 'Video no encontrado o no disponible',
-                            'used_cookies': self.use_cookies
-                        }
-                    
-                    # Formatear información
-                    duration = info.get('duration', 0)
-                    if duration > 0:
-                        minutes = duration // 60
-                        seconds = duration % 60
-                        duration_str = f"{minutes}:{seconds:02d}"
-                    else:
-                        duration_str = "Desconocida"
-                    
-                    # Verificar si hay formatos disponibles
-                    formats = info.get('formats', [])
-                    has_formats = len(formats) > 0
-                    
-                    return {
-                        'success': True,
-                        'title': info.get('title', 'Video sin título'),
-                        'duration': duration_str,
-                        'duration_seconds': duration,
-                        'uploader': info.get('uploader', 'Desconocido'),
-                        'view_count': info.get('view_count', 0),
-                        'thumbnail': info.get('thumbnail', ''),
-                        'available': True,
-                        'has_formats': has_formats,
-                        'formats_count': len(formats),
-                        'used_cookies': self.use_cookies,
-                        'attempt': attempt + 1
-                    }
-                    
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                last_error = error_msg
-                
-                # Analizar tipo de error
-                if "HTTP Error 429" in error_msg:
-                    logger.warning(f"⏳ Error 429 (Too Many Requests) en intento {attempt + 1}")
-                    # Esperar más tiempo antes de reintentar
-                    wait_time = Config.RETRY_DELAY * (attempt + 2)  # Esperar más en cada intento
-                    logger.info(f"Esperando {wait_time}s antes de reintentar...")
-                    time.sleep(wait_time)
+                if user_id in self.active_tasks:
+                    log_event(f"⏳ Usuario {user_id} ya tiene tarea activa, reencolando...")
+                    new_priority = max(0, priority - 0.1)
+                    await self.add_task(new_priority, task_data)
+                    self.priority_queue.task_done()
+                    await asyncio.sleep(2)
                     continue
                 
-                elif "Failed to extract any player response" in error_msg:
-                    logger.warning(f"⚠️  Error de player response en intento {attempt + 1}")
-                    # Cambiar estrategia: no usar cookies en próximo intento
-                    self.use_cookies = False
+                self.active_tasks[user_id] = task_id
+                try:
+                    await self._process_task(worker_id, task_data)
+                finally:
+                    if user_id in self.active_tasks:
+                        del self.active_tasks[user_id]
+                    self.priority_queue.task_done()
                     
-                elif "cookies are no longer valid" in error_msg:
-                    logger.warning("🍪 Cookies expiradas, desactivando...")
-                    self.use_cookies = False
-                    
-                else:
-                    logger.error(f"❌ Error en intento {attempt + 1}: {error_msg[:100]}")
-                
-                # Esperar antes del siguiente intento
-                if attempt < Config.MAX_RETRIES - 1:
-                    time.sleep(Config.RETRY_DELAY)
-                    
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                error_msg = str(e)
-                last_error = error_msg
-                logger.error(f"❌ Error inesperado en intento {attempt + 1}: {error_msg}")
+                log_event(f"❌ Error en worker {worker_id}: {e}")
+                await asyncio.sleep(2)
                 
-                if attempt < Config.MAX_RETRIES - 1:
-                    time.sleep(Config.RETRY_DELAY)
+    async def _process_task(self, worker_id, task_data):
+        """Procesa una tarea individual"""
+        job_id, user_id, url, tipo, chat_id, message_id = task_data
         
-        # Si llegamos aquí, todos los intentos fallaron
-        logger.error(f"❌ Todos los intentos fallaron para: {url}")
-        
-        # Mensaje de error amigable
-        if last_error and "HTTP Error 429" in last_error:
-            return {
-                'success': False,
-                'error': 'YouTube está limitando las solicitudes (Error 429). Por favor, espera unos minutos antes de intentar nuevamente.',
-                'used_cookies': self.use_cookies,
-                'suggestion': 'Intenta nuevamente en 2-3 minutos'
-            }
-        elif last_error and "Failed to extract any player response" in last_error:
-            return {
-                'success': False,
-                'error': 'No se pudo acceder al video. Puede ser privado, estar restringido o tener limitaciones de región.',
-                'used_cookies': self.use_cookies,
-                'suggestion': 'Verifica que el video sea público y esté disponible'
-            }
-        else:
-            return {
-                'success': False,
-                'error': f'Error al obtener información: {last_error[:200] if last_error else "Error desconocido"}',
-                'used_cookies': self.use_cookies
-            }
-    
-    def download_audio(self, url: str) -> Dict[str, Any]:
-        """Descarga audio con manejo robusto"""
-        self.temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
-        start_time = time.time()
-        
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                logger.info(f"🎵 Descargando audio (intento {attempt + 1}) para: {url[:50]}...")
-                
-                ydl_opts = self._get_base_options(attempt)
-                ydl_opts.update({
-                    'outtmpl': os.path.join(self.temp_dir, 'audio.%(ext)s'),
-                    'format': 'bestaudio/best',
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                    'keepvideo': False,
-                    'writethumbnail': False,
-                    'quiet': attempt == 0,  # Mostrar logs solo en primer intento
-                })
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    title = info.get('title', 'audio_descargado') if info else 'audio'
-                
-                # Buscar archivo MP3
-                for root, dirs, files in os.walk(self.temp_dir):
-                    for file in files:
-                        if file.endswith('.mp3'):
-                            self.output_path = os.path.join(root, file)
-                            break
-                    if self.output_path:
-                        break
-                
-                # Si no se encontró MP3, buscar otros formatos y convertir
-                if not self.output_path:
-                    audio_files = []
-                    for root, dirs, files in os.walk(self.temp_dir):
-                        for file in files:
-                            if any(file.endswith(ext) for ext in ['.m4a', '.webm', '.opus', '.wav']):
-                                audio_files.append(os.path.join(root, file))
-                    
-                    if audio_files:
-                        # Convertir el primer archivo a MP3
-                        audio_file = audio_files[0]
-                        mp3_output = os.path.join(self.temp_dir, 'converted.mp3')
-                        
-                        try:
-                            result = subprocess.run([
-                                'ffmpeg', '-i', audio_file,
-                                '-codec:a', 'libmp3lame',
-                                '-q:a', '2',
-                                '-y', mp3_output
-                            ], capture_output=True, text=True, timeout=120)
-                            
-                            if os.path.exists(mp3_output) and os.path.getsize(mp3_output) > 0:
-                                self.output_path = mp3_output
-                                logger.info("✅ Audio convertido a MP3 exitosamente")
-                        except Exception as e:
-                            logger.error(f"Error convirtiendo a MP3: {e}")
-                
-                if not self.output_path or not os.path.exists(self.output_path):
-                    if attempt < Config.MAX_RETRIES - 1:
-                        logger.warning(f"⚠️  No se generó archivo, reintentando...")
-                        time.sleep(Config.RETRY_DELAY)
-                        continue
-                    else:
-                        return {
-                            'success': False, 
-                            'error': 'No se pudo generar archivo de audio',
-                            'used_cookies': self.use_cookies
-                        }
-                
-                # Verificar archivo
-                file_size = os.path.getsize(self.output_path)
-                
-                if file_size == 0:
-                    if attempt < Config.MAX_RETRIES - 1:
-                        logger.warning("⚠️  Archivo vacío, reintentando...")
-                        time.sleep(Config.RETRY_DELAY)
-                        continue
-                    else:
-                        return {'success': False, 'error': 'Archivo vacío', 'used_cookies': self.use_cookies}
-                
-                if file_size > Config.MAX_FILE_SIZE:
-                    return {'success': False, 'error': 'Archivo muy grande', 'used_cookies': self.use_cookies}
-                
-                # Éxito
-                safe_title = ''.join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:100]
-                safe_title = safe_title or 'audio_descargado'
-                download_filename = f"{safe_title}.mp3"
-                
-                download_time = time.time() - start_time
-                
-                return {
-                    'success': True,
-                    'filename': download_filename,
-                    'filepath': self.output_path,
-                    'filesize': file_size,
-                    'filesize_mb': round(file_size / (1024 * 1024), 2),
-                    'download_time': round(download_time, 2),
-                    'title': title,
-                    'type': 'audio',
-                    'format': 'mp3',
-                    'used_cookies': self.use_cookies,
-                    'attempts': attempt + 1
-                }
-                    
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                logger.error(f"❌ Error de descarga (intento {attempt + 1}): {error_msg[:100]}")
-                
-                if "HTTP Error 429" in error_msg:
-                    wait_time = Config.RETRY_DELAY * (attempt + 2) * 2  # Esperar más por 429
-                    logger.info(f"⏳ Error 429, esperando {wait_time}s...")
-                    time.sleep(wait_time)
-                
-                if attempt < Config.MAX_RETRIES - 1:
-                    time.sleep(Config.RETRY_DELAY)
-                else:
-                    if "HTTP Error 429" in error_msg:
-                        return {
-                            'success': False,
-                            'error': 'YouTube está limitando las solicitudes. Por favor, espera unos minutos.',
-                            'used_cookies': self.use_cookies
-                        }
-                    else:
-                        return {'success': False, 'error': error_msg[:200], 'used_cookies': self.use_cookies}
-                    
-            except Exception as e:
-                logger.error(f"❌ Error inesperado (intento {attempt + 1}): {e}")
-                
-                if attempt < Config.MAX_RETRIES - 1:
-                    time.sleep(Config.RETRY_DELAY)
-                else:
-                    return {'success': False, 'error': str(e)[:200], 'used_cookies': self.use_cookies}
-        
-        return {'success': False, 'error': 'Todos los intentos fallaron', 'used_cookies': self.use_cookies}
-    
-    def cleanup(self):
-        """Limpia archivos temporales"""
         try:
-            if self.temp_dir and os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir, ignore_errors=True)
+            log_event(f"🔁 Worker {worker_id} procesando tarea para usuario {user_id}")
+            
+            progress_tracker = SafeProgressTracker(chat_id, message_id, user_id, self.app)
+            progress_trackers[user_id] = progress_tracker
+            
+            lang = get_user_language(user_id)
+            t = translations[lang]
+            
+            # Verificar límites
+            if "youtube.com" in url or "youtu.be" in url:
+                if not await puede_descargar_youtube(user_id):
+                    await progress_tracker.safe_edit_message(
+                        "❌ Has alcanzado tu límite diario de descargas de YouTube.\n\n"
+                        "💎 Conviértete en Premium para descargas ilimitadas de YouTube."
+                    )
+                    return
+            
+            await progress_tracker.safe_edit_message(t['analyzing_size'])
+            
+            # Analizar video
+            es_valido, tamano_estimado, titulo, duracion, calidad, formato = await analizar_video_con_detalles(url, user_id, tipo)
+            
+            if not es_valido:
+                if tipo.startswith("tt_"):
+                    tamano_mb = tamano_estimado / (1024 * 1024)
+                    error_msg = t['video_too_large'].format(tamano_mb)
+                    await progress_tracker.safe_edit_message(error_msg)
+                return
+                
+            tamano_mb = tamano_estimado / (1024 * 1024) if tamano_estimado > 0 else 0
+            duracion_formateada = format_duration(duracion) if duracion > 0 else "Desconocida"
+            
+            platform = "YouTube" if "youtube" in url else "TikTok"
+            info_msg = f"📊 **Información del {platform}:**\n• Duración: {duracion_formateada}\n• Tamaño estimado: {tamano_mb:.2f}MB\n• Calidad: {calidad}"
+            await progress_tracker.safe_edit_message(info_msg)
+            await asyncio.sleep(2)
+            
+            # Descargar
+            loop = asyncio.get_event_loop()
+            downloader = SafeParallelDownloader(url, user_id, tipo, progress_tracker)
+            downloader.estimated_size = tamano_estimado
+            
+            success = await loop.run_in_executor(executor, downloader.download)
+            filename = downloader.filename
+            
+            if not success or not filename:
+                error_msg = t['download_failed'].format(1)
+                await progress_tracker.safe_edit_message(error_msg)
+                log_event(f"❌ Error al descargar: {url}")
+                return
+                
+            await progress_tracker.safe_edit_message("📤 Preparando para enviar...")
+            
+            # Enviar archivo
+            await self._send_file(user_id, filename, tipo, progress_tracker)
+            
+            # Actualizar estadísticas
+            recompensa = incrementar_descarga(user_id)
+            
+            if "youtube.com" in url or "youtu.be" in url:
+                incrementar_descarga_youtube(user_id)
+                
+            actualizar_estadisticas(user_id)
+            
+            # Mostrar menú después de la descarga
+            await mostrar_menu_post_descarga(self.app, chat_id, message_id, recompensa)
+            
+            # Limpiar archivo temporal
+            try:
+                if filename and os.path.exists(filename):
+                    os.remove(filename)
+                    log_event(f"🧹 Archivo temporal eliminado: {filename}")
+            except Exception as e:
+                log_event(f"⚠️ Error eliminando archivo: {e}")
+                
         except Exception as e:
-            logger.debug(f"Error limpiando temporal: {e}")
-
-# ==============================
-# FLASK APP
-# ==============================
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# ==============================
-# ENDPOINTS
-# ==============================
-
-@app.route('/')
-def home():
-    """Endpoint principal"""
-    rate_status = rate_limiter.get_status()
-    cookies_valid = is_cookies_valid()
-    
-    return jsonify({
-        'service': 'YouTube Downloader API',
-        'version': '10.0 - Rate Limiting & Sin Cookies',
-        'status': 'online',
-        'rate_limiting': {
-            'enabled': Config.ENABLE_RATE_LIMITING,
-            'status': rate_status,
-            'requests_per_minute': Config.REQUESTS_PER_MINUTE
-        },
-        'cookies': {
-            'enabled': False,  # Forzamos sin cookies por ahora
-            'valid': cookies_valid,
-            'file_exists': os.path.exists(Config.COOKIES_FILE),
-            'note': 'Cookies deshabilitadas debido a problemas de expiración'
-        },
-        'endpoints': {
-            'GET /': 'Esta página',
-            'GET /health': 'Estado del servidor',
-            'GET /info?url=URL': 'Info del video',
-            'POST /info': 'Info del video (POST)',
-            'POST /download/audio': 'Descargar audio MP3',
-            'GET /rate/status': 'Estado del rate limiting',
-            'GET /system/status': 'Estado del sistema'
-        },
-        'notes': [
-            '✅ Rate limiting activado para evitar error 429',
-            '✅ Cookies deshabilitadas (problemas de expiración)',
-            '✅ User-Agents rotativos',
-            '✅ Sistema de reintentos automático'
-        ]
-    })
-
-@app.route('/health')
-def health():
-    """Health check"""
-    rate_status = rate_limiter.get_status()
-    
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'rate_limiting': rate_status,
-        'cookies': {
-            'file_exists': os.path.exists(Config.COOKIES_FILE),
-            'file_size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0,
-            'valid': is_cookies_valid(),
-            'enabled': False  # Siempre false por ahora
-        },
-        'system': {
-            'python': sys.version.split()[0],
-            'platform': sys.platform,
-            'uptime': 'unknown',  # Podría implementarse con variable global
-            'memory': 'unknown'
-        }
-    })
-
-@app.route('/info', methods=['GET', 'POST'])
-def get_info():
-    """Obtiene información del video"""
-    try:
-        # Obtener URL
-        if request.method == 'POST':
-            if request.is_json:
-                data = request.get_json()
-            elif request.form:
-                data = request.form.to_dict()
+            log_event(f"❌ Error procesando tarea: {e}")
+            try:
+                lang = get_user_language(user_id)
+                t = translations[lang]
+                await progress_tracker.safe_edit_message(f"❌ Error: {str(e)[:200]}")
+            except:
+                pass
+                
+    async def _send_file(self, user_id, filename, tipo, progress_tracker):
+        """Envía el archivo al usuario"""
+        try:
+            file_size = os.path.getsize(filename)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            if file_size > MAX_FILE_SIZE:
+                raise Exception(f"Archivo demasiado grande ({file_size_mb:.2f}MB)")
+            
+            # Simular progreso de envío
+            for progress in range(0, 101, 25):
+                await progress_tracker.update_upload_progress(progress)
+                await asyncio.sleep(0.3)
+            
+            timeout = 45  # Reducido para Render
+            
+            if tipo.endswith("video"):
+                with open(filename, 'rb') as video_file:
+                    await self.app.bot.send_video(
+                        chat_id=user_id,
+                        video=video_file,
+                        caption="✅ ¡Descarga completada!",
+                        supports_streaming=True,
+                        read_timeout=timeout,
+                        write_timeout=timeout,
+                        connect_timeout=timeout
+                    )
             else:
-                body_text = request.get_data(as_text=True)
-                data = {'url': body_text.strip()} if body_text else {}
-        else:  # GET
-            data = request.args
-        
-        url = data.get('url', '').strip()
-        
-        if not url:
-            return jsonify({'success': False, 'error': 'URL requerida'}), 400
-        
-        # Verificar si es URL de YouTube
-        if not ('youtube.com' in url or 'youtu.be' in url):
-            return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
-        
-        logger.info(f"📊 Info solicitada para: {url[:50]}...")
-        
-        # Crear downloader (sin cookies por defecto)
-        use_cookies_param = data.get('use_cookies', '').lower() == 'true'
-        downloader = YouTubeDownloader(use_cookies=use_cookies_param)
-        
-        # Obtener info
-        result = downloader.get_info(url)
-        downloader.cleanup()
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /info: {e}")
-        return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
+                with open(filename, 'rb') as audio_file:
+                    await self.app.bot.send_audio(
+                        chat_id=user_id,
+                        audio=audio_file,
+                        caption="✅ ¡Descarga completada!",
+                        read_timeout=timeout,
+                        write_timeout=timeout,
+                        connect_timeout=timeout
+                    )
+                    
+            await progress_tracker.update_upload_progress(100)
+            log_event(f"✅ Archivo enviado: {filename} ({file_size_mb:.2f}MB)")
+            
+        except Exception as e:
+            log_event(f"❌ Error enviando archivo: {e}")
+            raise
 
-@app.route('/download/audio', methods=['POST'])
-def download_audio():
-    """Descarga audio MP3"""
-    try:
-        # Obtener URL
-        if request.is_json:
-            data = request.get_json()
-        elif request.form:
-            data = request.form.to_dict()
+download_queue_system = DownloadQueueSystem(max_workers=MAX_WORKERS)
+
+# Estadísticas
+stats = {
+    "start_time": time.time(),
+    "total_downloads": 0,
+    "daily_downloads": 0,
+    "unique_users": set(),
+    "premium_users": 0,
+    "active_downloads": 0,
+    "completed_today": 0,
+    "queue_size": 0,
+    "errors": 0,
+    "total_rewards": 0.0,
+    "total_withdrawals": 0.0,
+    "total_referral_earnings": 0.0
+}
+
+# Traducciones (mantenemos las mismas)
+translations = {
+    "es": {
+        "welcome": "🌟 ¡Bienvenido al Bot de Descargas más Potente! 🚀",
+        "download_options": "🎬 Descarga videos y audio en calidad premium de TikTok y YouTube ✨",
+        "select_option": "👇 ¡Elige una opción y comienza a descargar!",
+        "download_content": "⬇️ Descargar Contenido",
+        "premium": "💎 Premium VIP",
+        "referrals": "👥 Programa de Referidos",
+        "stats": "📊 Mis Estadísticas",
+        "support": "🆘 Soporte Técnico",
+        "withdraw": "💰 Retirar Fondos",
+        "language": "🌐 Idioma/Language",
+        "menu_principal": "🏠 Menú Principal",
+        "back": "🔙 Volver",
+        "available_downloads": "📊 Descargas disponibles hoy: {}/{}",
+        "youtube_downloads": "🎵 Descargas de YouTube hoy: {}/{}",
+        "balance_info": "💰 Balance Actual: ${:.2f} USDT",
+        "withdraw_minimum": "⚠️ El mínimo para retirar es {} USDT",
+        "withdraw_success": "✅ ¡Retiro procesado exitosamente!",
+        "withdraw_request": "📋 Solicitud de retiro enviada para revisión",
+        "referral_notification": "🎉 ¡Has ganado ${} por referir a un nuevo usuario!",
+        "limit_reached": "⛔ ¡Límite Diario Alcanzado!",
+        "limit_message": "Has usado tus {} descargas gratuitas de hoy.\n🔓 Obtén descargas ilimitadas:",
+        "large_file": "📦 El archivo es grande ({:.2f}MB). ⏳ Esto puede tardar varios minutos...",
+        "community": "👥 Unirse a la Comunidad",
+        "donate": "❤️ Apoyar con Donación",
+        "video_too_large": "❌ **Video demasiado grande**\n\nEste video es de {:.2f}MB y supera el límite de 50MB. ⚠️\n\n💎 Conviértete en Premium para descargar videos de cualquier tamaño.",
+        "referral_earnings": "💰 **Ganancias por referidos:** ${:.2f} USDT",
+        "processing_queue": "⏳ **Procesando tu solicitud**\n\n{}",
+        "queue_position": "📊 Posición en cola: {}",
+        "premium_priority": "🚀 Prioridad Premium (procesamiento inmediato)",
+        "analyzing": "🔍 **Analizando video...**",
+        "downloading": "⬇️ **Descargando... {}%**",
+        "uploading": "📤 **Enviando... {}%**",
+        "daily_reminder": "📢 **Recordatorio Diario**\n\nTienes {} descargas disponibles hoy!\n\n",
+        "error_download": "❌ Error durante la descarga: {}",
+        "error_upload": "❌ Error durante el envío: {}",
+        "file_too_large": "❌ El archivo es demasiado grande ({:.2f}MB). El límite de Telegram es {:.2f}MB.",
+        "try_audio": "💡 Intenta descargar solo el audio o un video de menor calidad.",
+        "download_failed": "❌ La descarga falló después de {} intentos.",
+        "retrying": "🔄 Reintentando ({}/{})...",
+        "download_cancelled": "❌ Descarga cancelada debido a múltiples errores.",
+        "analyzing_size": "🔍 **Analizando video...**\n\n📊 Calculando tamaño y duración...",
+        "size_info": "📊 **Información del video:**\n• Duración: {}\n• Tamaño estimado: {:.2f}MB\n• Calidad: {}",
+        "new_referral": "🎉 **¡Nuevo referido!**\n\n@{} ha usado tu enlace de referido.\n💰 Has ganado ${:.2f} USDT de recompensa!",
+        "queue_stalled": "⚠️ **Procesamiento retrasado**\n\nEl sistema está experimentando alta demanda. Tu descarga se reanudará automáticamente.",
+        "youtube_premium_only": "❌ **YouTube requiere Premium para video**\n\nPara descargar videos de YouTube necesitas una cuenta Premium. 💎\n\n🎵 Pero puedes descargar el audio MP3 gratis (límite 3 por día)",
+        "more_rewards": "🎁 Más Recompensas",
+        "youtube_audio_only": "🎵 **Descarga de YouTube**\n\nLos usuarios gratuitos pueden descargar solo audio MP3 de YouTube (límite 3 por día).\n\n💎 Conviértete en Premium para descargar videos completos de YouTube.",
+        "enter_tx_hash": "🔍 **Verificación de Pago**\n\nPor favor, envía el **hash de la transacción (TX ID)** de tu pago de 4.99 USDT.\n\nEjemplo: `0x1234567890abcdef...`\n\n⚠️ Asegúrate de que:\n- El monto sea exactamente 4.99 USDT\n- La red sea BSC (BEP-20)\n- La transacción esté confirmada"
+    },
+    "en": {
+        "welcome": "🌟 Welcome to the Most Powerful Download Bot! 🚀",
+        "download_options": "🎬 Download premium quality videos and audio from TikTok and YouTube ✨",
+        "select_option": "👇 Choose an option and start downloading!",
+        "download_content": "⬇️ Download Content",
+        "premium": "💎 Premium VIP", 
+        "referrals": "👥 Referral Program",
+        "stats": "📊 My Statistics",
+        "support": "🆘 Technical Support",
+        "withdraw": "💰 Withdraw Funds",
+        "language": "🌐 Language/Idioma",
+        "menu_principal": "🏠 Main Menu",
+        "back": "🔙 Back",
+        "available_downloads": "📊 Downloads available today: {}/{}",
+        "youtube_downloads": "🎵 YouTube downloads today: {}/{}",
+        "balance_info": "💰 Current Balance: ${:.2f} USDT",
+        "withdraw_minimum": "⚠️ Minimum withdrawal is {} USDT",
+        "withdraw_success": "✅ Withdrawal processed successfully!",
+        "withdraw_request": "📋 Withdrawal request sent for review",
+        "referral_notification": "🎉 You've earned ${} for referring a new user!",
+        "limit_reached": "⛔ Daily Limit Reached!",
+        "limit_message": "You've used your {} free downloads today.\n🔓 Get unlimited downloads:",
+        "large_file": "📦 The file is large ({:.2f}MB). ⏳ This may take several minutes...",
+        "community": "👥 Join Community",
+        "donate": "❤️ Support with Donation",
+        "video_too_large": "❌ **Video too large**\n\nThis video is {:.2f}MB and exceeds the 50MB limit. ⚠️\n\n💎 Become Premium to download videos of any size.",
+        "referral_earnings": "💰 **Referral earnings:** ${:.2f} USDT",
+        "processing_queue": "⏳ **Processing your request**\n\n{}",
+        "queue_position": "📊 Queue position: {}",
+        "premium_priority": "🚀 Premium priority (immediate processing)",
+        "analyzing": "🔍 **Analyzing video...**",
+        "downloading": "⬇️ **Downloading... {}%**",
+        "uploading": "📤 **Uploading... {}%**",
+        "daily_reminder": "📢 **Daily Reminder**\n\nYou have {} downloads available today!\n\n",
+        "error_download": "❌ Error during download: {}",
+        "error_upload": "❌ Error during upload: {}",
+        "file_too_large": "❌ The file is too large ({:.2f}MB). The Telegram limit is {:.2f}MB.",
+        "try_audio": "💡 Try downloading only audio or a lower quality video.",
+        "download_failed": "❌ Download failed after {} attempts.",
+        "retrying": "🔄 Retrying ({}/{})...",
+        "download_cancelled": "❌ Download cancelled due to multiple errors.",
+        "analyzing_size": "🔍 **Analyzing video...**\n\n📊 Calculating size and duration...",
+        "size_info": "📊 **Video information:**\n• Duration: {}\n• Estimated size: {:.2f}MB\n• Quality: {}",
+        "new_referral": "🎉 **New referral!**\n\n@{} used your referral link.\n💰 You earned ${:.2f} USDT reward!",
+        "queue_stalled": "⚠️ **Processing delayed**\n\nThe system is experiencing high demand. Your download will resume automatically.",
+        "youtube_premium_only": "❌ **YouTube requires Premium for video**\n\nTo download YouTube videos you need a Premium account. 💎\n\n🎵 But you can download MP3 audio for free (limit 3 per day)",
+        "more_rewards": "🎁 More Rewards",
+        "youtube_audio_only": "🎵 **YouTube Download**\n\nFree users can only download MP3 audio from YouTube (limit 3 per day).\n\n💎 Become Premium to download full YouTube videos.",
+        "enter_tx_hash": "🔍 **Payment Verification**\n\nPlease send the **transaction hash (TX ID)** of your 4.99 USDT payment.\n\nExample: `0x1234567890abcdef...`\n\n⚠️ Make sure:\n- Amount is exactly 4.99 USDT\n- Network is BSC (BEP-20)\n- Transaction is confirmed"
+    }
+}
+
+# Funciones auxiliares (mantener las mismas pero optimizadas)
+def print_stats():
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed_time = time.time() - stats["start_time"]
+    hours, remainder = divmod(elapsed_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    stats["queue_size"] = download_queue_system.priority_queue.qsize()
+    stats["active_downloads"] = len(download_queue_system.active_tasks)
+    
+    print(f"\n🤖 BOT ACTIVO | {current_time}")
+    print("=" * 50)
+    print(f"⬇️  DESCARGAS TOTALES: {stats['total_downloads']}")
+    print(f"📊 DESCARGAS HOY: {stats['daily_downloads']}")
+    print(f"👤 USUARIOS ÚNICOS: {len(stats['unique_users'])}")
+    print(f"💎 USUARIOS PREMIUM: {stats['premium_users']}")
+    print(f"🚀 DESCARGAS ACTIVAS: {stats['active_downloads']}")
+    print(f"⏳ EN COLA: {stats['queue_size']}")
+    print(f"✅ COMPLETADAS HOY: {stats['completed_today']}")
+    print(f"❌ ERRORES: {stats['errors']}")
+    print(f"💰 RECOMPENSAS: ${stats['total_rewards']:.2f}")
+    print(f"💸 RETIROS: ${stats['total_withdrawals']:.2f}")
+    print(f"👥 GANANCIAS POR REFERIDOS: ${stats['total_referral_earnings']:.2f}")
+    print(f"⏱  TIEMPO ACTIVO: {int(hours)}h {int(minutes)}m {int(seconds)}s")
+    print("=" * 50)
+
+def log_event(event):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {event}")
+
+# ... (mantener todas las funciones auxiliares del código original)
+# Solo necesitamos ajustar las que usan recursos intensivos
+
+def conectar_db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def crear_tabla():
+    conn = conectar_db()
+    # ... (mantener igual)
+    conn.close()
+
+def es_url_valida(url):
+    patterns = [
+        r'https?://(www\.)?tiktok\.com/',
+        r'https?://vm\.tiktok\.com/',
+        r'https?://(www\.)?youtube\.com/',
+        r'https?://youtu\.be/'
+    ]
+    return any(re.match(pattern, url) for pattern in patterns)
+
+# ... (continuar con todas las funciones auxiliares)
+
+# Ajustar la función download del SafeParallelDownloader para usar menos recursos
+class SafeParallelDownloader:
+    def __init__(self, url, user_id, tipo, progress_tracker):
+        self.url = url
+        self.user_id = user_id
+        self.tipo = tipo
+        self.filename = None
+        self.video_title = None
+        self.estimated_size = 0
+        self.priority = 0 if es_premium(user_id) else 1
+        self.timestamp = int(time.time())
+        self.prefix = "download"
+        self.base_filename = f"{self.prefix}_{user_id}_{self.timestamp}"
+        self.progress_tracker = progress_tracker
+        
+    def get_video_info(self):
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'forcejson': True,
+                'socket_timeout': 30,
+                'extract_flat': False
+            }
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+                self.video_title = info.get('title', 'video')
+                self.estimated_size = info.get('filesize', 0) or info.get('filesize_approx', 0)
+                return True
+        except Exception as e:
+            log_event(f"❌ Error obteniendo información del video: {e}")
+            self.video_title = None
+            self.estimated_size = 0
+            return False
+            
+    def download(self):
+        try:
+            if not self.get_video_info():
+                return False
+                
+            ydl_opts = self._get_ydl_options()
+            
+            ydl_opts['progress_hooks'] = [self._progress_hook]
+            
+            # Configuración optimizada para Render
+            ydl_opts['socket_timeout'] = 45
+            ydl_opts['retries'] = 2
+            ydl_opts['fragment_retries'] = 2
+            ydl_opts['extract_flat'] = False
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([self.url])
+            
+            # Buscar archivo descargado
+            for file in os.listdir('.'):
+                if file.startswith(self.base_filename):
+                    self.filename = file
+                    
+                    if self.video_title:
+                        file_ext = os.path.splitext(file)[1]
+                        safe_title = sanitize_filename(self.video_title)
+                        new_filename = f"{safe_title}{file_ext}"
+                        
+                        counter = 1
+                        original_new_filename = new_filename
+                        while os.path.exists(new_filename):
+                            new_filename = f"{os.path.splitext(original_new_filename)[0]}_{counter}{file_ext}"
+                            counter += 1
+                            
+                        os.rename(file, new_filename)
+                        self.filename = new_filename
+                    
+                    file_size = os.path.getsize(self.filename)
+                    if file_size > MAX_FILE_SIZE:
+                        os.remove(self.filename)
+                        raise Exception(f"El archivo es demasiado grande ({file_size/1024/1024:.2f}MB)")
+                        
+                    return True
+            return False
+        except Exception as e:
+            log_event(f"❌ Error en descarga: {e}")
+            stats["errors"] += 1
+            return False
+            
+    def _progress_hook(self, d):
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes', 0)
+            downloaded = d.get('downloaded_bytes', 0)
+            if total and downloaded:
+                progress = int((downloaded / total) * 100)
+                if progress % 10 == 0:  # Actualizar cada 10% para reducir carga
+                    try:
+                        asyncio.run(self.progress_tracker.update_download_progress(progress))
+                    except RuntimeError:
+                        pass  # Ignorar si el event loop está cerrado
+        
+    def _get_ydl_options(self):
+        base_opts = {
+            'outtmpl': self.base_filename + '.%(ext)s',
+            'noprogress': True,
+            'socket_timeout': 45,
+            'retries': 2,
+            'fragment_retries': 2,
+            'concurrent_fragment_downloads': 4,  # Reducido para Render
+            'http_chunk_size': 2 * 1024 * 1024,  # Reducido
+            'abort_on_unavailable_fragment': True,
+            'quiet': True,
+        }
+        
+        if self.tipo == "tt_video":
+            return {**base_opts, 'format': 'best[filesize<50000000]'}  # Limitado a 50MB
+        elif self.tipo == "tt_audio":
+            return {
+                **base_opts,
+                'format': 'bestaudio[filesize<30000000]/bestaudio',
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
+            }
+        elif self.tipo == "yt_audio":
+            return {
+                **base_opts,
+                'format': 'bestaudio[filesize<30000000]/bestaudio',
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
+            }
+        elif self.tipo == "yt_video":
+            return {**base_opts, 'format': 'best[filesize<100000000]'}  # Limitado a 100MB
         else:
-            body_text = request.get_data(as_text=True)
-            data = {'url': body_text.strip()} if body_text else {}
-        
-        url = data.get('url', '').strip()
-        
-        if not url:
-            return jsonify({'success': False, 'error': 'URL requerida'}), 400
-        
-        if not ('youtube.com' in url or 'youtu.be' in url):
-            return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
-        
-        logger.info(f"🎵 Audio solicitado para: {url[:50]}...")
-        
-        # Opción de usar cookies (por si acaso)
-        use_cookies = data.get('use_cookies', '').lower() == 'true'
-        downloader = YouTubeDownloader(use_cookies=use_cookies)
-        
-        # Descargar
-        result = downloader.download_audio(url)
-        
-        if not result['success']:
-            downloader.cleanup()
-            return jsonify(result), 400
-        
-        # Enviar archivo
-        response = send_file(
-            result['filepath'],
-            as_attachment=True,
-            download_name=result['filename'],
-            mimetype='audio/mpeg',
-            conditional=True
-        )
-        
-        # Headers informativos
-        response.headers['X-File-Size'] = str(result['filesize'])
-        response.headers['X-Download-Time'] = str(result['download_time'])
-        response.headers['X-Used-Cookies'] = str(result.get('used_cookies', False))
-        response.headers['X-Attempts'] = str(result.get('attempts', 1))
-        
-        # Limpiar después de enviar
-        @response.call_on_close
-        def cleanup_after_send():
-            downloader.cleanup()
-        
-        return response
-        
+            return {**base_opts, 'format': 'best[filesize<50000000]'}
+
+# Mantener todas las demás funciones iguales...
+
+# Función main optimizada
+def main():
+    crear_tabla()
+    
+    stats["start_time"] = time.time()
+    print_stats()
+    log_event("🤖 Iniciando bot de descargas en Render...")
+    
+    # Verificar variables de entorno
+    if not BOT_TOKEN:
+        log_event("❌ ERROR: BOT_TOKEN no configurado")
+        sys.exit(1)
+    
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(CommandHandler("withdraw", withdraw_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_descarga))
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    
+    application.add_error_handler(error_handler)
+    
+    # Iniciar sistema de colas
+    start_background_tasks(application)
+    
+    log_event("🚀 Bot en ejecución en Render...")
+    
+    try:
+        application.run_polling()
+    except KeyboardInterrupt:
+        log_event("🛑 Bot detenido por el usuario")
     except Exception as e:
-        logger.error(f"❌ Error en /download/audio: {e}")
-        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+        log_event(f"❌ Error crítico: {e}")
+    finally:
+        executor.shutdown(wait=False)
 
-@app.route('/rate/status', methods=['GET'])
-def rate_status():
-    """Estado del rate limiting"""
-    status = rate_limiter.get_status()
-    
-    return jsonify({
-        'rate_limiting': {
-            'enabled': Config.ENABLE_RATE_LIMITING,
-            'recent_requests': status['recent_requests'],
-            'limit_per_minute': status['limit_per_minute'],
-            'available_requests': status['available'],
-            'oldest_request_seconds_ago': time.time() - status['oldest_request'] if status['oldest_request'] else None
-        },
-        'configuration': {
-            'requests_per_minute': Config.REQUESTS_PER_MINUTE,
-            'max_retries': Config.MAX_RETRIES,
-            'retry_delay': Config.RETRY_DELAY
-        }
-    })
-
-@app.route('/system/status', methods=['GET'])
-def system_status():
-    """Estado del sistema"""
-    # Verificar ffmpeg
-    ffmpeg_available = False
-    try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        ffmpeg_available = True
-    except:
-        pass
-    
-    # Espacio en disco
-    disk_info = {}
-    try:
-        stat = shutil.disk_usage('.')
-        disk_info = {
-            'total_gb': round(stat.total / (1024**3), 2),
-            'used_gb': round(stat.used / (1024**3), 2),
-            'free_gb': round(stat.free / (1024**3), 2),
-            'free_percent': round((stat.free / stat.total) * 100, 1)
-        }
-    except:
-        pass
-    
-    return jsonify({
-        'system': {
-            'python_version': sys.version,
-            'platform': sys.platform,
-            'current_directory': os.getcwd(),
-            'temp_directory': tempfile.gettempdir()
-        },
-        'dependencies': {
-            'ffmpeg': 'available' if ffmpeg_available else 'not available',
-            'yt_dlp': yt_dlp.version.__version__
-        },
-        'disk': disk_info,
-        'cookies': {
-            'file': Config.COOKIES_FILE,
-            'exists': os.path.exists(Config.COOKIES_FILE),
-            'size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0,
-            'valid': is_cookies_valid()
-        }
-    })
-
-@app.route('/test/video/<video_id>', methods=['GET'])
-def test_video(video_id):
-    """Endpoint de prueba para videos específicos"""
-    test_videos = {
-        'dQw4w9WgXcQ': 'Rick Astley - Never Gonna Give You Up',
-        'pwh60pqDDz0': 'Video de prueba (no especificado)',
-        '9bZkp7q19f0': 'PSY - GANGNAM STYLE',
-        'kJQP7kiw5Fk': 'Luis Fonsi - Despacito',
-    }
-    
-    video_name = test_videos.get(video_id, 'Video desconocido')
-    url = f'https://www.youtube.com/watch?v={video_id}'
-    
-    logger.info(f"🧪 Test video: {video_name} ({video_id})")
-    
-    downloader = YouTubeDownloader(use_cookies=False)
-    result = downloader.get_info(url)
-    downloader.cleanup()
-    
-    result['test_info'] = {
-        'video_id': video_id,
-        'video_name': video_name,
-        'url': url
-    }
-    
-    return jsonify(result)
-
-# ==============================
-# ERROR HANDLERS
-# ==============================
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'success': False, 'error': 'Endpoint no encontrado'}), 404
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({'success': False, 'error': 'Método no permitido'}), 405
-
-@app.errorhandler(429)
-def too_many_requests(error):
-    return jsonify({
-        'success': False,
-        'error': 'Demasiadas solicitudes. Por favor, espera unos minutos.',
-        'wait_time_seconds': 60
-    }), 429
-
-@app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"❌ Error 500: {error}")
-    return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
-
-# ==============================
-# INICIALIZACIÓN
-# ==============================
-if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("🚀 SERVIDOR YOUTUBE - VERSIÓN 10.0")
-    print("="*70)
-    
-    # Estado del sistema
-    print("📊 Estado del sistema:")
-    print(f"  • Puerto: {Config.PORT}")
-    print(f"  • Host: {Config.HOST}")
-    print(f"  • Rate limiting: {'✅ ACTIVADO' if Config.ENABLE_RATE_LIMITING else '❌ DESACTIVADO'}")
-    print(f"  • Límite: {Config.REQUESTS_PER_MINUTE} solicitudes/minuto")
-    print(f"  • User-Agents: {len(Config.USER_AGENTS)} disponibles")
-    
-    # Cookies
-    cookies_valid = is_cookies_valid()
-    print(f"  • Cookies: {'✅ VÁLIDAS' if cookies_valid else '❌ INVÁLIDAS/NO USADAS'}")
-    if os.path.exists(Config.COOKIES_FILE):
-        size = os.path.getsize(Config.COOKIES_FILE)
-        print(f"    Archivo: {Config.COOKIES_FILE} ({size} bytes)")
-    
-    # Dependencias
-    try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        print("  • FFmpeg: ✅ DISPONIBLE")
-    except:
-        print("  • FFmpeg: ❌ NO DISPONIBLE (conversiones limitadas)")
-    
-    print("="*70)
-    print("📡 Endpoints principales:")
-    print("  GET /                 - Información del servicio")
-    print("  POST /info            - Info de video (JSON o form)")
-    print("  POST /download/audio  - Descargar audio MP3")
-    print("  GET /rate/status      - Estado del rate limiting")
-    print("  GET /test/video/ID    - Probar video específico")
-    print("="*70)
-    print("💡 Consejos:")
-    print("  1. Si recibes error 429, espera 1-2 minutos")
-    print("  2. Los videos muy nuevos pueden no estar disponibles")
-    print("  3. Usa /test/video/dQw4w9WgXcQ para probar")
-    print("="*70 + "\n")
-    
-    app.run(
-        host=Config.HOST,
-        port=Config.PORT,
-        debug=False,
-        threaded=True
-    )
+if __name__ == "__main__":
+    main()
