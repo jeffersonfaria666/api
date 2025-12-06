@@ -1,3 +1,4 @@
+# bot.py
 import os
 import sys
 import time
@@ -15,11 +16,12 @@ from telegram.error import BadRequest, RetryAfter
 from flask import Flask, jsonify, request
 from threading import Thread
 import json
+import signal
 
 # Configuración
-BOT_TOKEN = "7239423213:AAE6lmCeiuz9_GoeujWDYo64B0FOfcHoFFA"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7239423213:AAE6lmCeiuz9_GoeujWDYo64B0FOfcHoFFA")
 USDT_ADDRESS = "0x594EAB95D5683851E0eBFfC457C07dc217Bf4830".lower()
-BSC_API_KEY = "9769MICJ2Z1PAEZVVZCX9HKYSIRWVYZA"
+BSC_API_KEY = os.environ.get("BSC_API_KEY", "9769MICJ2Z1PAEZVVZCX9HKYSIRWVYZA")
 LIMIT_POR_DIA = 100
 MIN_USDT = 4.99
 DB_NAME = "usuarios.db"
@@ -2317,7 +2319,18 @@ def run_api():
     log_event(f"🌐 Iniciando API web en puerto {API_PORT}...")
     api_app.run(host=API_HOST, port=API_PORT, debug=False, use_reloader=False)
 
+def signal_handler(signum, frame):
+    """Manejador de señales para cerrar correctamente"""
+    log_event(f"🛑 Recibida señal {signum}, cerrando...")
+    download_queue_system.is_running = False
+    executor.shutdown(wait=False)
+    sys.exit(0)
+
 def main():
+    # Configurar manejadores de señales
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     crear_tabla()
     
     stats["start_time"] = time.time()
