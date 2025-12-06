@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🚀 SERVIDOR YOUTUBE - VERSIÓN RESISTENTE A ERRORES
-Versión: 9.0 - Manejo mejorado de errores y cookies
+🚀 SERVIDOR YOUTUBE - VERSIÓN SIN COOKIES CON RATE LIMITING
+Versión: 10.0 - Manejo de errores 429 y cookies expiradas
 """
 
 import os
@@ -13,8 +13,11 @@ import shutil
 import time
 import subprocess
 import random
-from datetime import datetime
-from typing import Dict, Any, Optional
+import threading
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
+from collections import defaultdict
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -28,13 +31,94 @@ class Config:
     HOST = '0.0.0.0'
     MAX_FILE_SIZE = 200 * 1024 * 1024
     COOKIES_FILE = 'cookies.txt'
-    TEMP_RETRIES = 3
+    
+    # Rate limiting
+    REQUESTS_PER_MINUTE = 30  # Límite conservador para evitar 429
+    ENABLE_RATE_LIMITING = True
+    
+    # User Agents
     USER_AGENTS = [
+        # Chrome en Windows
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+        
+        # Firefox
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
+        
+        # Safari
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        
+        # Edge
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+        
+        # Mobile
+        'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
     ]
+    
+    # Proxies (opcional, dejar vacío si no se usan)
+    PROXIES = []  # Ejemplo: ['http://proxy1:port', 'http://proxy2:port']
+    
+    # Retry configuration
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2  # segundos entre reintentos
+    
+    # Timeouts
+    SOCKET_TIMEOUT = 45
+    CONNECT_TIMEOUT = 30
+
+# ==============================
+# RATE LIMITER
+# ==============================
+class RateLimiter:
+    """Simple rate limiter para evitar error 429"""
+    def __init__(self, requests_per_minute: int = 30):
+        self.requests_per_minute = requests_per_minute
+        self.request_times = []
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        """Espera si se ha excedido el límite de requests"""
+        if not Config.ENABLE_RATE_LIMITING:
+            return
+        
+        with self.lock:
+            now = time.time()
+            
+            # Limpiar requests más viejos de 1 minuto
+            cutoff_time = now - 60
+            self.request_times = [t for t in self.request_times if t > cutoff_time]
+            
+            # Si estamos cerca del límite, esperar
+            if len(self.request_times) >= self.requests_per_minute:
+                oldest_time = self.request_times[0]
+                wait_time = 60 - (now - oldest_time)
+                if wait_time > 0:
+                    logger.info(f"⏳ Rate limiting: esperando {wait_time:.1f}s")
+                    time.sleep(wait_time)
+                    # Actualizar lista después de esperar
+                    now = time.time()
+                    cutoff_time = now - 60
+                    self.request_times = [t for t in self.request_times if t > cutoff_time]
+            
+            # Agregar este request
+            self.request_times.append(now)
+    
+    def get_status(self):
+        """Obtener estado actual del rate limiter"""
+        with self.lock:
+            now = time.time()
+            cutoff_time = now - 60
+            recent_requests = [t for t in self.request_times if t > cutoff_time]
+            return {
+                'recent_requests': len(recent_requests),
+                'limit_per_minute': self.requests_per_minute,
+                'available': self.requests_per_minute - len(recent_requests),
+                'oldest_request': min(recent_requests) if recent_requests else None
+            }
 
 # ==============================
 # SETUP DE LOGGING
@@ -46,10 +130,15 @@ def setup_logging():
         handlers=[logging.StreamHandler(sys.stdout)]
     )
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
-    logging.getLogger('yt_dlp').setLevel(logging.WARNING)
+    logging.getLogger('yt_dlp').setLevel(logging.ERROR)  # Reducir logs de yt-dlp
     return logging.getLogger(__name__)
 
 logger = setup_logging()
+
+# ==============================
+# INSTANCIAS GLOBALES
+# ==============================
+rate_limiter = RateLimiter(Config.REQUESTS_PER_MINUTE)
 
 # ==============================
 # UTILIDADES
@@ -57,112 +146,92 @@ logger = setup_logging()
 def get_random_user_agent():
     return random.choice(Config.USER_AGENTS)
 
-def clean_cookies_file():
-    """Limpia el archivo de cookies de líneas inválidas"""
-    if not os.path.exists(Config.COOKIES_FILE):
-        return False
-    
-    try:
-        with open(Config.COOKIES_FILE, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        # Filtrar solo líneas válidas (que contengan .youtube.com)
-        valid_lines = []
-        for line in lines:
-            line = line.strip()
-            if line.startswith('#') or not line:
-                valid_lines.append(line)
-            elif '.youtube.com' in line and len(line.split('\t')) >= 7:
-                valid_lines.append(line)
-        
-        if len(valid_lines) > 5:  # Si hay suficientes cookies válidas
-            with open(Config.COOKIES_FILE, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(valid_lines))
-            logger.info(f"✅ Cookies limpiadas: {len(valid_lines)} líneas válidas")
-            return True
-        else:
-            logger.warning("⚠️  Pocas cookies válidas encontradas")
-            return False
-    except Exception as e:
-        logger.error(f"Error limpiando cookies: {e}")
-        return False
+def get_proxy():
+    """Obtener proxy aleatorio si están configurados"""
+    if Config.PROXIES:
+        return random.choice(Config.PROXIES)
+    return None
 
-def check_cookies_validity():
-    """Verifica si las cookies son válidas"""
+def is_cookies_valid():
+    """Verificar si las cookies son válidas (básico)"""
     if not os.path.exists(Config.COOKIES_FILE):
-        return False, "Archivo no existe"
+        return False
     
     try:
         size = os.path.getsize(Config.COOKIES_FILE)
         if size < 100:
-            return False, "Archivo muy pequeño"
+            return False
         
+        # Verificar si tienen formato Netscape
+        with open(Config.COOKIES_FILE, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            if 'Netscape HTTP Cookie File' not in first_line:
+                return False
+        
+        # Verificar si tienen cookies de YouTube
         with open(Config.COOKIES_FILE, 'r', encoding='utf-8') as f:
             content = f.read()
+            if '.youtube.com' not in content:
+                return False
         
-        # Verificar formato básico
-        if '.youtube.com' not in content:
-            return False, "No contiene dominio youtube.com"
-        
-        # Verificar cookies importantes
-        required_cookies = ['__Secure-3PSID', 'LOGIN_INFO', 'SID']
-        has_required = any(cookie in content for cookie in required_cookies)
-        
-        if not has_required:
-            return True, "Cookies básicas encontradas (algunas pueden faltar)"
-        
-        return True, "Cookies válidas detectadas"
-    except Exception as e:
-        return False, f"Error: {str(e)}"
+        return True
+    except:
+        return False
+
+def should_use_cookies():
+    """Decide si usar cookies basado en su validez y estado actual"""
+    if not is_cookies_valid():
+        logger.info("⚠️  Cookies inválidas o expiradas, operando sin cookies")
+        return False
+    
+    # Las cookies pueden ser válidas pero causar problemas
+    # Por ahora, mejor no usarlas si hemos tenido problemas
+    return False  # Forzar sin cookies por ahora
 
 # ==============================
 # CLASE PRINCIPAL
 # ==============================
 class YouTubeDownloader:
-    def __init__(self):
+    def __init__(self, use_cookies: bool = None):
         self.temp_dir = None
         self.output_path = None
-        self.cookies_config = {}
-        self.cookies_valid = False
         
-        self._init_cookies()
-    
-    def _init_cookies(self):
-        """Inicializa las cookies con verificación robusta"""
-        # Primero limpiar el archivo de cookies
-        clean_cookies_file()
-        
-        # Verificar validez
-        self.cookies_valid, message = check_cookies_validity()
-        
-        if self.cookies_valid:
-            self.cookies_config = {
-                'cookiefile': Config.COOKIES_FILE,
-                'cookiesfrombrowser': None  # Forzar uso del archivo
-            }
-            logger.info(f"✅ {message}")
+        # Decidir si usar cookies
+        if use_cookies is None:
+            self.use_cookies = should_use_cookies()
         else:
-            logger.warning(f"⚠️  {message} - Operando sin cookies")
+            self.use_cookies = use_cookies
+        
+        logger.info(f"📡 Modo: {'CON cookies' if self.use_cookies else 'SIN cookies'}")
     
-    def _get_base_options(self, retry_count=0):
-        """Opciones base con manejo de reintentos"""
+    def _get_base_options(self, attempt: int = 0):
+        """Opciones base optimizadas para evitar 429"""
+        
+        # Aplicar rate limiting
+        rate_limiter.wait_if_needed()
+        
+        # User Agent específico para este intento
+        user_agent = get_random_user_agent()
+        
         base_opts = {
             'quiet': True,
-            'no_warnings': retry_count > 1,  # Mostrar warnings solo en primeros intentos
+            'no_warnings': attempt > 0,  # Solo warnings en primer intento
             'ignoreerrors': True,
             'no_color': True,
             'noprogress': True,
-            'socket_timeout': 30 + (retry_count * 10),
+            'socket_timeout': Config.SOCKET_TIMEOUT,
+            'connect_timeout': Config.CONNECT_TIMEOUT,
             'retries': 10,
             'fragment_retries': 10,
             'skip_unavailable_fragments': True,
             'noplaylist': True,
             'extract_flat': False,
             'ignore_no_formats_error': True,
+            'throttled_rate': '1M',  # Limitar velocidad de descarga
             
-            # Headers dinámicos
+            # Headers para parecer navegador real
             'http_headers': {
-                'User-Agent': get_random_user_agent(),
+                'User-Agent': user_agent,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -173,47 +242,60 @@ class YouTubeDownloader:
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1',
                 'Cache-Control': 'max-age=0',
+                'DNT': '1',
             },
             
-            # Configuraciones específicas para YouTube
-            'youtube_include_dash_manifest': True,
-            'youtube_include_hls_manifest': True,
+            # Configuración específica de YouTube
+            'youtube_include_dash_manifest': False,
+            'youtube_include_hls_manifest': False,
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android', 'web'],
+                    'player_skip': ['configs'],
                     'skip': ['hls', 'dash'],
                 }
             },
         }
         
-        # Añadir cookies solo si son válidas y no estamos en reintento fallido
-        if self.cookies_valid and retry_count < 2:
-            base_opts.update(self.cookies_config)
+        # Añadir cookies si se deben usar
+        if self.use_cookies and is_cookies_valid():
+            base_opts['cookiefile'] = Config.COOKIES_FILE
+            logger.debug("Usando cookies del archivo")
+        
+        # Añadir proxy si está configurado (solo en reintentos)
+        if attempt > 0 and Config.PROXIES:
+            proxy = get_proxy()
+            if proxy:
+                base_opts['proxy'] = proxy
+                logger.info(f"Usando proxy: {proxy}")
         
         # En reintentos, cambiar estrategia
-        if retry_count > 0:
-            base_opts['extractor_args']['youtube']['player_client'].append('ios')
+        if attempt > 0:
+            # Cambiar User Agent
             base_opts['http_headers']['User-Agent'] = get_random_user_agent()
+            
+            # Aumentar timeouts
+            base_opts['socket_timeout'] = Config.SOCKET_TIMEOUT + (attempt * 10)
+            base_opts['connect_timeout'] = Config.CONNECT_TIMEOUT + (attempt * 5)
+            
+            # Forzar modo simple en último intento
+            if attempt >= 2:
+                base_opts['extract_flat'] = True
+                if 'cookiefile' in base_opts:
+                    del base_opts['cookiefile']
         
         return base_opts
     
     def get_info(self, url: str) -> Dict[str, Any]:
-        """Obtiene información del video con reintentos"""
-        max_retries = 2
+        """Obtiene información del video con manejo robusto de errores"""
         last_error = None
         
-        for attempt in range(max_retries + 1):
+        for attempt in range(Config.MAX_RETRIES):
             try:
+                logger.info(f"📊 Obteniendo info (intento {attempt + 1}) para: {url[:50]}...")
+                
                 ydl_opts = self._get_base_options(attempt)
                 ydl_opts['skip_download'] = True
-                
-                # En el último intento, forzar modo simple
-                if attempt == max_retries:
-                    ydl_opts['extract_flat'] = True
-                    if 'cookiefile' in ydl_opts:
-                        del ydl_opts['cookiefile']
-                
-                logger.info(f"Obteniendo info (intento {attempt + 1}) para: {url[:50]}...")
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -221,8 +303,8 @@ class YouTubeDownloader:
                     if not info:
                         return {
                             'success': False, 
-                            'error': 'Video no encontrado',
-                            'has_cookies': self.cookies_valid
+                            'error': 'Video no encontrado o no disponible',
+                            'used_cookies': self.use_cookies
                         }
                     
                     # Formatear información
@@ -234,6 +316,10 @@ class YouTubeDownloader:
                     else:
                         duration_str = "Desconocida"
                     
+                    # Verificar si hay formatos disponibles
+                    formats = info.get('formats', [])
+                    has_formats = len(formats) > 0
+                    
                     return {
                         'success': True,
                         'title': info.get('title', 'Video sin título'),
@@ -243,57 +329,72 @@ class YouTubeDownloader:
                         'view_count': info.get('view_count', 0),
                         'thumbnail': info.get('thumbnail', ''),
                         'available': True,
-                        'has_cookies': self.cookies_valid,
-                        'formats_count': len(info.get('formats', [])),
+                        'has_formats': has_formats,
+                        'formats_count': len(formats),
+                        'used_cookies': self.use_cookies,
                         'attempt': attempt + 1
                     }
                     
             except yt_dlp.utils.DownloadError as e:
                 error_msg = str(e)
                 last_error = error_msg
-                logger.warning(f"Intento {attempt + 1} fallido: {error_msg[:100]}")
                 
-                # Si es error de player response, intentar sin cookies
-                if "Failed to extract any player response" in error_msg:
-                    logger.info("Probando sin cookies en próximo intento...")
-                    # Forzar no cookies en próximo intento
-                    self.cookies_valid = False
+                # Analizar tipo de error
+                if "HTTP Error 429" in error_msg:
+                    logger.warning(f"⏳ Error 429 (Too Many Requests) en intento {attempt + 1}")
+                    # Esperar más tiempo antes de reintentar
+                    wait_time = Config.RETRY_DELAY * (attempt + 2)  # Esperar más en cada intento
+                    logger.info(f"Esperando {wait_time}s antes de reintentar...")
+                    time.sleep(wait_time)
                     continue
                 
-                # Esperar antes de reintentar
-                if attempt < max_retries:
-                    time.sleep(1)
+                elif "Failed to extract any player response" in error_msg:
+                    logger.warning(f"⚠️  Error de player response en intento {attempt + 1}")
+                    # Cambiar estrategia: no usar cookies en próximo intento
+                    self.use_cookies = False
+                    
+                elif "cookies are no longer valid" in error_msg:
+                    logger.warning("🍪 Cookies expiradas, desactivando...")
+                    self.use_cookies = False
+                    
+                else:
+                    logger.error(f"❌ Error en intento {attempt + 1}: {error_msg[:100]}")
+                
+                # Esperar antes del siguiente intento
+                if attempt < Config.MAX_RETRIES - 1:
+                    time.sleep(Config.RETRY_DELAY)
                     
             except Exception as e:
                 error_msg = str(e)
                 last_error = error_msg
-                logger.error(f"Error en get_info (intento {attempt + 1}): {error_msg}")
-                if attempt < max_retries:
-                    time.sleep(1)
+                logger.error(f"❌ Error inesperado en intento {attempt + 1}: {error_msg}")
+                
+                if attempt < Config.MAX_RETRIES - 1:
+                    time.sleep(Config.RETRY_DELAY)
         
         # Si llegamos aquí, todos los intentos fallaron
-        error_msg = last_error or "Error desconocido"
+        logger.error(f"❌ Todos los intentos fallaron para: {url}")
         
-        # Mensajes de error más amigables
-        if "Private" in error_msg or "Sign in" in error_msg:
-            return {
-                'success': False, 
-                'error': 'Video privado o requiere login',
-                'has_cookies': self.cookies_valid,
-                'suggestion': 'Verifica que las cookies sean válidas y estén actualizadas'
-            }
-        elif "Failed to extract any player response" in error_msg:
+        # Mensaje de error amigable
+        if last_error and "HTTP Error 429" in last_error:
             return {
                 'success': False,
-                'error': 'Error de conexión con YouTube',
-                'has_cookies': self.cookies_valid,
-                'suggestion': 'Intenta nuevamente en unos momentos o verifica la URL'
+                'error': 'YouTube está limitando las solicitudes (Error 429). Por favor, espera unos minutos antes de intentar nuevamente.',
+                'used_cookies': self.use_cookies,
+                'suggestion': 'Intenta nuevamente en 2-3 minutos'
+            }
+        elif last_error and "Failed to extract any player response" in last_error:
+            return {
+                'success': False,
+                'error': 'No se pudo acceder al video. Puede ser privado, estar restringido o tener limitaciones de región.',
+                'used_cookies': self.use_cookies,
+                'suggestion': 'Verifica que el video sea público y esté disponible'
             }
         else:
             return {
-                'success': False, 
-                'error': f'Error: {error_msg[:200]}',
-                'has_cookies': self.cookies_valid
+                'success': False,
+                'error': f'Error al obtener información: {last_error[:200] if last_error else "Error desconocido"}',
+                'used_cookies': self.use_cookies
             }
     
     def download_audio(self, url: str) -> Dict[str, Any]:
@@ -301,116 +402,141 @@ class YouTubeDownloader:
         self.temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
         start_time = time.time()
         
-        try:
-            # Opciones para audio con múltiples formatos de respaldo
-            ydl_opts = self._get_base_options(0)
-            ydl_opts.update({
-                'outtmpl': os.path.join(self.temp_dir, '%(title)s.%(ext)s'),
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'keepvideo': False,
-                'writethumbnail': False,
-                'quiet': False,  # Mostrar progreso para debugging
-            })
-            
-            logger.info(f"Descargando audio: {url}")
-            
-            # Intentar descarga
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'audio') if info else 'audio'
-            
-            # Buscar archivo MP3
-            for root, dirs, files in os.walk(self.temp_dir):
-                for file in files:
-                    if file.endswith('.mp3'):
-                        self.output_path = os.path.join(root, file)
-                        break
-                if self.output_path:
-                    break
-            
-            # Si no hay MP3, buscar y convertir
-            if not self.output_path:
-                audio_files = []
+        for attempt in range(Config.MAX_RETRIES):
+            try:
+                logger.info(f"🎵 Descargando audio (intento {attempt + 1}) para: {url[:50]}...")
+                
+                ydl_opts = self._get_base_options(attempt)
+                ydl_opts.update({
+                    'outtmpl': os.path.join(self.temp_dir, 'audio.%(ext)s'),
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    'keepvideo': False,
+                    'writethumbnail': False,
+                    'quiet': attempt == 0,  # Mostrar logs solo en primer intento
+                })
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    title = info.get('title', 'audio_descargado') if info else 'audio'
+                
+                # Buscar archivo MP3
                 for root, dirs, files in os.walk(self.temp_dir):
                     for file in files:
-                        if any(file.endswith(ext) for ext in ['.m4a', '.webm', '.opus', '.wav']):
-                            audio_files.append(os.path.join(root, file))
+                        if file.endswith('.mp3'):
+                            self.output_path = os.path.join(root, file)
+                            break
+                    if self.output_path:
+                        break
                 
-                if audio_files:
-                    # Convertir el primer archivo a MP3
-                    audio_file = audio_files[0]
-                    mp3_output = os.path.join(self.temp_dir, 'converted.mp3')
+                # Si no se encontró MP3, buscar otros formatos y convertir
+                if not self.output_path:
+                    audio_files = []
+                    for root, dirs, files in os.walk(self.temp_dir):
+                        for file in files:
+                            if any(file.endswith(ext) for ext in ['.m4a', '.webm', '.opus', '.wav']):
+                                audio_files.append(os.path.join(root, file))
                     
-                    try:
-                        result = subprocess.run([
-                            'ffmpeg', '-i', audio_file,
-                            '-codec:a', 'libmp3lame',
-                            '-q:a', '2',
-                            '-y', mp3_output
-                        ], capture_output=True, text=True, timeout=60)
+                    if audio_files:
+                        # Convertir el primer archivo a MP3
+                        audio_file = audio_files[0]
+                        mp3_output = os.path.join(self.temp_dir, 'converted.mp3')
                         
-                        if os.path.exists(mp3_output):
-                            self.output_path = mp3_output
-                    except Exception as e:
-                        logger.error(f"Error convirtiendo a MP3: {e}")
-            
-            if not self.output_path or not os.path.exists(self.output_path):
-                return {
-                    'success': False, 
-                    'error': 'No se pudo generar archivo de audio',
-                    'has_cookies': self.cookies_valid
-                }
-            
-            file_size = os.path.getsize(self.output_path)
-            
-            if file_size == 0:
-                return {'success': False, 'error': 'Archivo vacío', 'has_cookies': self.cookies_valid}
-            
-            if file_size > Config.MAX_FILE_SIZE:
-                return {'success': False, 'error': 'Archivo muy grande', 'has_cookies': self.cookies_valid}
-            
-            # Nombre seguro para descarga
-            safe_title = ''.join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:100]
-            safe_title = safe_title or 'audio_descargado'
-            download_filename = f"{safe_title}.mp3"
-            
-            download_time = time.time() - start_time
-            
-            return {
-                'success': True,
-                'filename': download_filename,
-                'filepath': self.output_path,
-                'filesize': file_size,
-                'filesize_mb': round(file_size / (1024 * 1024), 2),
-                'download_time': round(download_time, 2),
-                'title': title,
-                'type': 'audio',
-                'format': 'mp3',
-                'has_cookies': self.cookies_valid
-            }
+                        try:
+                            result = subprocess.run([
+                                'ffmpeg', '-i', audio_file,
+                                '-codec:a', 'libmp3lame',
+                                '-q:a', '2',
+                                '-y', mp3_output
+                            ], capture_output=True, text=True, timeout=120)
+                            
+                            if os.path.exists(mp3_output) and os.path.getsize(mp3_output) > 0:
+                                self.output_path = mp3_output
+                                logger.info("✅ Audio convertido a MP3 exitosamente")
+                        except Exception as e:
+                            logger.error(f"Error convirtiendo a MP3: {e}")
                 
-        except yt_dlp.utils.DownloadError as e:
-            error_msg = str(e)
-            logger.error(f"Error de descarga: {error_msg}")
-            
-            if "Failed to extract any player response" in error_msg:
-                return {
-                    'success': False,
-                    'error': 'Error de conexión con YouTube',
-                    'has_cookies': self.cookies_valid,
-                    'suggestion': 'Las cookies pueden estar expiradas o la URL es inválida'
-                }
-            else:
-                return {'success': False, 'error': error_msg[:200], 'has_cookies': self.cookies_valid}
+                if not self.output_path or not os.path.exists(self.output_path):
+                    if attempt < Config.MAX_RETRIES - 1:
+                        logger.warning(f"⚠️  No se generó archivo, reintentando...")
+                        time.sleep(Config.RETRY_DELAY)
+                        continue
+                    else:
+                        return {
+                            'success': False, 
+                            'error': 'No se pudo generar archivo de audio',
+                            'used_cookies': self.use_cookies
+                        }
                 
-        except Exception as e:
-            logger.error(f"Error descargando audio: {e}")
-            return {'success': False, 'error': str(e)[:200], 'has_cookies': self.cookies_valid}
+                # Verificar archivo
+                file_size = os.path.getsize(self.output_path)
+                
+                if file_size == 0:
+                    if attempt < Config.MAX_RETRIES - 1:
+                        logger.warning("⚠️  Archivo vacío, reintentando...")
+                        time.sleep(Config.RETRY_DELAY)
+                        continue
+                    else:
+                        return {'success': False, 'error': 'Archivo vacío', 'used_cookies': self.use_cookies}
+                
+                if file_size > Config.MAX_FILE_SIZE:
+                    return {'success': False, 'error': 'Archivo muy grande', 'used_cookies': self.use_cookies}
+                
+                # Éxito
+                safe_title = ''.join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()[:100]
+                safe_title = safe_title or 'audio_descargado'
+                download_filename = f"{safe_title}.mp3"
+                
+                download_time = time.time() - start_time
+                
+                return {
+                    'success': True,
+                    'filename': download_filename,
+                    'filepath': self.output_path,
+                    'filesize': file_size,
+                    'filesize_mb': round(file_size / (1024 * 1024), 2),
+                    'download_time': round(download_time, 2),
+                    'title': title,
+                    'type': 'audio',
+                    'format': 'mp3',
+                    'used_cookies': self.use_cookies,
+                    'attempts': attempt + 1
+                }
+                    
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                logger.error(f"❌ Error de descarga (intento {attempt + 1}): {error_msg[:100]}")
+                
+                if "HTTP Error 429" in error_msg:
+                    wait_time = Config.RETRY_DELAY * (attempt + 2) * 2  # Esperar más por 429
+                    logger.info(f"⏳ Error 429, esperando {wait_time}s...")
+                    time.sleep(wait_time)
+                
+                if attempt < Config.MAX_RETRIES - 1:
+                    time.sleep(Config.RETRY_DELAY)
+                else:
+                    if "HTTP Error 429" in error_msg:
+                        return {
+                            'success': False,
+                            'error': 'YouTube está limitando las solicitudes. Por favor, espera unos minutos.',
+                            'used_cookies': self.use_cookies
+                        }
+                    else:
+                        return {'success': False, 'error': error_msg[:200], 'used_cookies': self.use_cookies}
+                    
+            except Exception as e:
+                logger.error(f"❌ Error inesperado (intento {attempt + 1}): {e}")
+                
+                if attempt < Config.MAX_RETRIES - 1:
+                    time.sleep(Config.RETRY_DELAY)
+                else:
+                    return {'success': False, 'error': str(e)[:200], 'used_cookies': self.use_cookies}
+        
+        return {'success': False, 'error': 'Todos los intentos fallaron', 'used_cookies': self.use_cookies}
     
     def cleanup(self):
         """Limpia archivos temporales"""
@@ -433,17 +559,23 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 @app.route('/')
 def home():
     """Endpoint principal"""
-    cookies_valid, message = check_cookies_validity()
+    rate_status = rate_limiter.get_status()
+    cookies_valid = is_cookies_valid()
     
     return jsonify({
         'service': 'YouTube Downloader API',
-        'version': '9.0 - Resistentes a Errores',
+        'version': '10.0 - Rate Limiting & Sin Cookies',
         'status': 'online',
+        'rate_limiting': {
+            'enabled': Config.ENABLE_RATE_LIMITING,
+            'status': rate_status,
+            'requests_per_minute': Config.REQUESTS_PER_MINUTE
+        },
         'cookies': {
-            'enabled': cookies_valid,
-            'message': message,
-            'file': Config.COOKIES_FILE,
-            'size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0
+            'enabled': False,  # Forzamos sin cookies por ahora
+            'valid': cookies_valid,
+            'file_exists': os.path.exists(Config.COOKIES_FILE),
+            'note': 'Cookies deshabilitadas debido a problemas de expiración'
         },
         'endpoints': {
             'GET /': 'Esta página',
@@ -451,29 +583,37 @@ def home():
             'GET /info?url=URL': 'Info del video',
             'POST /info': 'Info del video (POST)',
             'POST /download/audio': 'Descargar audio MP3',
-            'GET /cookies/status': 'Estado detallado cookies',
-            'GET /cookies/refresh': 'Refrescar cookies'
-        }
+            'GET /rate/status': 'Estado del rate limiting',
+            'GET /system/status': 'Estado del sistema'
+        },
+        'notes': [
+            '✅ Rate limiting activado para evitar error 429',
+            '✅ Cookies deshabilitadas (problemas de expiración)',
+            '✅ User-Agents rotativos',
+            '✅ Sistema de reintentos automático'
+        ]
     })
 
 @app.route('/health')
 def health():
     """Health check"""
-    cookies_valid, message = check_cookies_validity()
+    rate_status = rate_limiter.get_status()
     
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
+        'rate_limiting': rate_status,
         'cookies': {
-            'valid': cookies_valid,
-            'message': message,
             'file_exists': os.path.exists(Config.COOKIES_FILE),
-            'file_size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0
+            'file_size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0,
+            'valid': is_cookies_valid(),
+            'enabled': False  # Siempre false por ahora
         },
         'system': {
             'python': sys.version.split()[0],
             'platform': sys.platform,
-            'working_directory': os.getcwd()
+            'uptime': 'unknown',  # Podría implementarse con variable global
+            'memory': 'unknown'
         }
     })
 
@@ -502,17 +642,20 @@ def get_info():
         if not ('youtube.com' in url or 'youtu.be' in url):
             return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
         
-        logger.info(f"Info solicitada para: {url[:50]}...")
+        logger.info(f"📊 Info solicitada para: {url[:50]}...")
         
-        # Procesar
-        downloader = YouTubeDownloader()
+        # Crear downloader (sin cookies por defecto)
+        use_cookies_param = data.get('use_cookies', '').lower() == 'true'
+        downloader = YouTubeDownloader(use_cookies=use_cookies_param)
+        
+        # Obtener info
         result = downloader.get_info(url)
         downloader.cleanup()
         
         return jsonify(result)
         
     except Exception as e:
-        logger.error(f"Error en /info: {e}")
+        logger.error(f"❌ Error en /info: {e}")
         return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
 @app.route('/download/audio', methods=['POST'])
@@ -536,10 +679,13 @@ def download_audio():
         if not ('youtube.com' in url or 'youtu.be' in url):
             return jsonify({'success': False, 'error': 'URL de YouTube inválida'}), 400
         
-        logger.info(f"Audio solicitado para: {url[:50]}...")
+        logger.info(f"🎵 Audio solicitado para: {url[:50]}...")
+        
+        # Opción de usar cookies (por si acaso)
+        use_cookies = data.get('use_cookies', '').lower() == 'true'
+        downloader = YouTubeDownloader(use_cookies=use_cookies)
         
         # Descargar
-        downloader = YouTubeDownloader()
         result = downloader.download_audio(url)
         
         if not result['success']:
@@ -558,7 +704,8 @@ def download_audio():
         # Headers informativos
         response.headers['X-File-Size'] = str(result['filesize'])
         response.headers['X-Download-Time'] = str(result['download_time'])
-        response.headers['X-Has-Cookies'] = str(result.get('has_cookies', False))
+        response.headers['X-Used-Cookies'] = str(result.get('used_cookies', False))
+        response.headers['X-Attempts'] = str(result.get('attempts', 1))
         
         # Limpiar después de enviar
         @response.call_on_close
@@ -568,92 +715,99 @@ def download_audio():
         return response
         
     except Exception as e:
-        logger.error(f"Error en /download/audio: {e}")
+        logger.error(f"❌ Error en /download/audio: {e}")
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
-@app.route('/cookies/status', methods=['GET'])
-def cookies_status():
-    """Estado detallado de cookies"""
-    cookies_valid, message = check_cookies_validity()
+@app.route('/rate/status', methods=['GET'])
+def rate_status():
+    """Estado del rate limiting"""
+    status = rate_limiter.get_status()
     
-    if not os.path.exists(Config.COOKIES_FILE):
-        return jsonify({
-            'exists': False,
-            'valid': False,
-            'message': 'Archivo no encontrado',
-            'path': os.path.abspath(Config.COOKIES_FILE)
-        })
-    
-    try:
-        with open(Config.COOKIES_FILE, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        
-        lines = content.strip().split('\n')
-        youtube_lines = [l for l in lines if '.youtube.com' in l]
-        
-        # Contar cookies importantes
-        important_cookies = {
-            '__Secure-3PSID': 0,
-            'LOGIN_INFO': 0,
-            'SID': 0,
-            '__Secure-1PSID': 0,
-            'VISITOR_INFO1_LIVE': 0,
-            'YSC': 0
-        }
-        
-        for cookie_name in important_cookies:
-            important_cookies[cookie_name] = sum(1 for l in youtube_lines if cookie_name in l)
-        
-        return jsonify({
-            'exists': True,
-            'valid': cookies_valid,
-            'message': message,
-            'details': {
-                'file_size': os.path.getsize(Config.COOKIES_FILE),
-                'total_lines': len(lines),
-                'youtube_cookies': len(youtube_lines),
-                'important_cookies': important_cookies,
-                'has_netscape_header': any('Netscape HTTP Cookie File' in l for l in lines[:3]),
-                'sample': content[:500] + '...' if len(content) > 500 else content
-            }
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'exists': True,
-            'valid': False,
-            'error': str(e),
-            'path': os.path.abspath(Config.COOKIES_FILE)
-        })
-
-@app.route('/cookies/refresh', methods=['GET'])
-def refresh_cookies():
-    """Refresca y limpia las cookies"""
-    try:
-        cleaned = clean_cookies_file()
-        cookies_valid, message = check_cookies_validity()
-        
-        return jsonify({
-            'success': True,
-            'cleaned': cleaned,
-            'valid': cookies_valid,
-            'message': message,
-            'file_size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        })
-
-@app.route('/test', methods=['GET'])
-def test_connection():
-    """Endpoint de prueba simple"""
     return jsonify({
-        'success': True,
-        'message': 'Servidor funcionando',
-        'timestamp': datetime.now().isoformat()
+        'rate_limiting': {
+            'enabled': Config.ENABLE_RATE_LIMITING,
+            'recent_requests': status['recent_requests'],
+            'limit_per_minute': status['limit_per_minute'],
+            'available_requests': status['available'],
+            'oldest_request_seconds_ago': time.time() - status['oldest_request'] if status['oldest_request'] else None
+        },
+        'configuration': {
+            'requests_per_minute': Config.REQUESTS_PER_MINUTE,
+            'max_retries': Config.MAX_RETRIES,
+            'retry_delay': Config.RETRY_DELAY
+        }
     })
+
+@app.route('/system/status', methods=['GET'])
+def system_status():
+    """Estado del sistema"""
+    # Verificar ffmpeg
+    ffmpeg_available = False
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        ffmpeg_available = True
+    except:
+        pass
+    
+    # Espacio en disco
+    disk_info = {}
+    try:
+        stat = shutil.disk_usage('.')
+        disk_info = {
+            'total_gb': round(stat.total / (1024**3), 2),
+            'used_gb': round(stat.used / (1024**3), 2),
+            'free_gb': round(stat.free / (1024**3), 2),
+            'free_percent': round((stat.free / stat.total) * 100, 1)
+        }
+    except:
+        pass
+    
+    return jsonify({
+        'system': {
+            'python_version': sys.version,
+            'platform': sys.platform,
+            'current_directory': os.getcwd(),
+            'temp_directory': tempfile.gettempdir()
+        },
+        'dependencies': {
+            'ffmpeg': 'available' if ffmpeg_available else 'not available',
+            'yt_dlp': yt_dlp.version.__version__
+        },
+        'disk': disk_info,
+        'cookies': {
+            'file': Config.COOKIES_FILE,
+            'exists': os.path.exists(Config.COOKIES_FILE),
+            'size': os.path.getsize(Config.COOKIES_FILE) if os.path.exists(Config.COOKIES_FILE) else 0,
+            'valid': is_cookies_valid()
+        }
+    })
+
+@app.route('/test/video/<video_id>', methods=['GET'])
+def test_video(video_id):
+    """Endpoint de prueba para videos específicos"""
+    test_videos = {
+        'dQw4w9WgXcQ': 'Rick Astley - Never Gonna Give You Up',
+        'pwh60pqDDz0': 'Video de prueba (no especificado)',
+        '9bZkp7q19f0': 'PSY - GANGNAM STYLE',
+        'kJQP7kiw5Fk': 'Luis Fonsi - Despacito',
+    }
+    
+    video_name = test_videos.get(video_id, 'Video desconocido')
+    url = f'https://www.youtube.com/watch?v={video_id}'
+    
+    logger.info(f"🧪 Test video: {video_name} ({video_id})")
+    
+    downloader = YouTubeDownloader(use_cookies=False)
+    result = downloader.get_info(url)
+    downloader.cleanup()
+    
+    result['test_info'] = {
+        'video_id': video_id,
+        'video_name': video_name,
+        'url': url
+    }
+    
+    return jsonify(result)
 
 # ==============================
 # ERROR HANDLERS
@@ -666,50 +820,62 @@ def not_found(error):
 def method_not_allowed(error):
     return jsonify({'success': False, 'error': 'Método no permitido'}), 405
 
+@app.errorhandler(429)
+def too_many_requests(error):
+    return jsonify({
+        'success': False,
+        'error': 'Demasiadas solicitudes. Por favor, espera unos minutos.',
+        'wait_time_seconds': 60
+    }), 429
+
 @app.errorhandler(500)
 def internal_error(error):
-    logger.error(f"Error 500: {error}")
-    return jsonify({'success': False, 'error': 'Error interno'}), 500
+    logger.error(f"❌ Error 500: {error}")
+    return jsonify({'success': False, 'error': 'Error interno del servidor'}), 500
 
 # ==============================
 # INICIALIZACIÓN
 # ==============================
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("🚀 SERVIDOR YOUTUBE - VERSIÓN RESISTENTE 9.0")
-    print("="*60)
+    print("\n" + "="*70)
+    print("🚀 SERVIDOR YOUTUBE - VERSIÓN 10.0")
+    print("="*70)
     
-    # Verificar cookies
-    cookies_valid, message = check_cookies_validity()
-    if cookies_valid:
-        print(f"✅ Cookies: {message}")
-    else:
-        print(f"⚠️  Cookies: {message}")
+    # Estado del sistema
+    print("📊 Estado del sistema:")
+    print(f"  • Puerto: {Config.PORT}")
+    print(f"  • Host: {Config.HOST}")
+    print(f"  • Rate limiting: {'✅ ACTIVADO' if Config.ENABLE_RATE_LIMITING else '❌ DESACTIVADO'}")
+    print(f"  • Límite: {Config.REQUESTS_PER_MINUTE} solicitudes/minuto")
+    print(f"  • User-Agents: {len(Config.USER_AGENTS)} disponibles")
     
-    # Verificar ffmpeg
+    # Cookies
+    cookies_valid = is_cookies_valid()
+    print(f"  • Cookies: {'✅ VÁLIDAS' if cookies_valid else '❌ INVÁLIDAS/NO USADAS'}")
+    if os.path.exists(Config.COOKIES_FILE):
+        size = os.path.getsize(Config.COOKIES_FILE)
+        print(f"    Archivo: {Config.COOKIES_FILE} ({size} bytes)")
+    
+    # Dependencias
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        print("✅ FFmpeg: Disponible")
+        print("  • FFmpeg: ✅ DISPONIBLE")
     except:
-        print("⚠️  FFmpeg: No disponible (la conversión puede fallar)")
+        print("  • FFmpeg: ❌ NO DISPONIBLE (conversiones limitadas)")
     
-    print(f"✅ Puerto: {Config.PORT}")
-    print(f"✅ Host: {Config.HOST}")
-    print("="*60)
-    print("📡 Endpoints:")
-    print("  GET /                 - Esta página")
-    print("  GET /health           - Estado del servidor")
-    print("  POST /info            - Info del video")
+    print("="*70)
+    print("📡 Endpoints principales:")
+    print("  GET /                 - Información del servicio")
+    print("  POST /info            - Info de video (JSON o form)")
     print("  POST /download/audio  - Descargar audio MP3")
-    print("  GET /cookies/status   - Verificar cookies")
-    print("  GET /cookies/refresh  - Limpiar cookies")
-    print("="*60)
-    print("🔧 Características:")
-    print("  • Reintentos automáticos")
-    print("  • Manejo robusto de errores")
-    print("  • User-Agents rotativos")
-    print("  • Limpieza automática de cookies")
-    print("="*60 + "\n")
+    print("  GET /rate/status      - Estado del rate limiting")
+    print("  GET /test/video/ID    - Probar video específico")
+    print("="*70)
+    print("💡 Consejos:")
+    print("  1. Si recibes error 429, espera 1-2 minutos")
+    print("  2. Los videos muy nuevos pueden no estar disponibles")
+    print("  3. Usa /test/video/dQw4w9WgXcQ para probar")
+    print("="*70 + "\n")
     
     app.run(
         host=Config.HOST,
